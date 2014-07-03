@@ -56,7 +56,6 @@ typedef struct hwc_context {
 
     int drm_fd;
     kms_display_t displays[HWC_NUM_DISPLAY_TYPES];
-    int ion_client;
 
     pthread_t event_thread;
 

@@ -1,5 +1,5 @@
 #include <hwcomposer_drm.h>
-#include <ion/ion.h>
+#include "gralloc_priv.h"
 
 struct hwc_context;
 
@@ -81,6 +81,7 @@ static void vblank_handler(int fd, unsigned int frame, unsigned int sec,
 static int init_display(hwc_context_t *ctx)
 {
 	kms_display_t *d = &ctx->displays[HWC_DISPLAY_PRIMARY];
+	const char *modules[] = { "i915", "radeon", "nouveau", "vmwgfx", "omapdrm", "exynos", "tilcdc", "msm", "sti" };
 	int drm_fd;
 	int i, n;
 	drmModeResPtr resources;
@@ -88,11 +89,18 @@ static int init_display(hwc_context_t *ctx)
 	drmModeEncoder *encoder;
 	drmModeModeInfoPtr mode;
 	uint32_t possible_crtcs;
+	private_module_t *m = NULL;
 
 	 /* Open DRM device */
-	/* TODO: find driver name dynamically */
-	drm_fd = drmOpen("sti", NULL);
-	if (drm_fd == -1) {
+	for (i = 0; i < ARRAY_SIZE(modules); i++) {
+		drm_fd = drmOpen(modules[i], NULL);
+		if (drm_fd >= 0) {
+			ALOGI("Open %s drm device (%d)\n", modules[i], drm_fd);
+			break;
+		}
+	}
+
+	if (drm_fd < 0) {
 		ALOGE("Failed to open DRM: %s\n", strerror(errno));
 		return -EINVAL;
 	}
@@ -125,6 +133,15 @@ static int init_display(hwc_context_t *ctx)
 	}
 
 	ctx->drm_fd = drm_fd;
+	{
+		hw_module_t *pmodule = NULL;
+		private_module_t *m = NULL;
+		hw_get_module(GRALLOC_HARDWARE_MODULE_ID, (const hw_module_t **)&pmodule);
+		m = reinterpret_cast<private_module_t *>(pmodule);
+		ALOGI("Set drm fd (%d) to gralloc", drm_fd);
+		m->drm_fd = drm_fd;
+	}
+
 	d->con = connector;
 	d->enc = encoder;
 	d->crtc_id = resources->crtcs[i];
@@ -224,11 +241,13 @@ static int update_display(hwc_context_t *ctx, int disp,
 	return 0;
    }
 
-     dmabuf_fd = hnd->share_fd;
+    dmabuf_fd = hnd->share_fd;
     width = hnd->width;
     height = hnd->height;
 
     uint32_t bo[4] = { 0 };
+
+
     ret = drmPrimeFDToHandle(ctx->drm_fd, dmabuf_fd, &bo[0]);
     if (ret) {
         ALOGE("cannot create handle from FD :%d\n", dmabuf_fd);
@@ -255,7 +274,6 @@ static int update_display(hwc_context_t *ctx, int disp,
     kdisp->last_fb = fb;
 
     return 0;
-
 }
 
 
@@ -476,13 +494,13 @@ static int hwc_device_open(const struct hw_module_t *module, const char *name,
 
     *device = &ctx->device.common;
 
-    ctx->ion_client = ion_open();
+    /*ctx->ion_client = ion_open();
     if (ctx->ion_client < 0)
     {
 	   AERR("Could not open ion device for hwcomposer %d", ctx->ion_client);
 	   return -EINVAL;
     }
-    ALOGE("ion_open success :%d\n", ctx->ion_client);
+    ALOGE("ion_open success :%d\n", ctx->ion_client);*/
 
     return 0;
 }
