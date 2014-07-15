@@ -215,10 +215,11 @@ static void *event_handler (void *arg)
 static int update_display(hwc_context_t *ctx, int disp,
         hwc_display_contents_1_t *display)
 {
-    int dmabuf_fd = 0, ret = 0;
+    int ret = 0;
     int width = 0, height = 0;
     uint32_t fb = 0;
     kms_display_t *kdisp = &ctx->displays[disp];
+
     if (!kdisp->con)
         return 0;
 
@@ -234,25 +235,17 @@ static int update_display(hwc_context_t *ctx, int disp,
         return -EINVAL;
     }
 
-   private_handle_t const *hnd = reinterpret_cast<private_handle_t const *>(target->handle);
+	private_handle_t const *hnd = reinterpret_cast<private_handle_t const *>(target->handle);
 
-   if (!(hnd->flags & private_handle_t::PRIV_FLAGS_USES_ION)) {
-	AERR("private_handle_t isn't using ION, hnd->flags %d", hnd->flags);
-	return 0;
-   }
+	if (!(hnd->flags & private_handle_t::PRIV_FLAGS_USES_ION)) {
+		AERR("private_handle_t isn't using ION, hnd->flags %d", hnd->flags);
+		return 0;
+	}
 
-    dmabuf_fd = hnd->share_fd;
     width = hnd->width;
     height = hnd->height;
 
-    uint32_t bo[4] = { 0 };
-
-
-    ret = drmPrimeFDToHandle(ctx->drm_fd, dmabuf_fd, &bo[0]);
-    if (ret) {
-        ALOGE("cannot create handle from FD :%d\n", dmabuf_fd);
-        return ret;
-    }
+    uint32_t bo[4] = { hnd->drm_hnd };
     uint32_t pitch[4] = { width * 4}; //stride
     uint32_t offset[4] = { 0 };
 
@@ -262,12 +255,14 @@ static int update_display(hwc_context_t *ctx, int disp,
         ALOGE("cannot create framebuffer (%d): %m\n",errno);
         return ret;
     }
+
     ret = drmModeSetCrtc(ctx->drm_fd, kdisp->crtc_id, fb, 0, 0,
                 &kdisp->con->connector_id, 1, kdisp->mode);
     if (ret) {
         ALOGE("cannot set CRTC for connector %u (%d): %m\n", kdisp->con->connector_id, ret);
         return ret;
     }
+
     /* Clean up */
     if (kdisp->last_fb)
         drmModeRmFB(ctx->drm_fd, kdisp->last_fb);
@@ -286,7 +281,7 @@ static int hwc_prepare (struct hwc_composer_device_1 *dev,
         return 0;
     if ((contents->flags & HWC_GEOMETRY_CHANGED) == 0)
         return 0;
-    
+
     for (size_t i = 0; i < contents->numHwLayers; i++) {
         hwc_layer_1_t *layers = &contents->hwLayers[i];
         //dump_layer(&layers[i]);
@@ -322,9 +317,10 @@ static int hwc_set (struct hwc_composer_device_1 *dev,
 static int hwc_eventControl (struct hwc_composer_device_1* dev, int disp,
         int event, int enabled)
 {
+	hwc_context_t *ctx = to_ctx(dev);
+
     if (disp < 0 || disp >= HWC_NUM_DISPLAY_TYPES)
-        return -EINVAL;    
-    hwc_context_t *ctx = to_ctx(dev);
+        return -EINVAL;
 
     switch (event) {
         case HWC_EVENT_VSYNC:
@@ -346,12 +342,12 @@ static int hwc_query (struct hwc_composer_device_1* dev, int what, int *value)
         value[0] = 1;   //support the background layer
         break;
     case HWC_VSYNC_PERIOD:
-        *value = 1000000000 / refreshRate;
+        value[0] = 1000000000 / refreshRate;
         break;
    case HWC_DISPLAY_TYPES_SUPPORTED:
-        *value = HWC_DISPLAY_PRIMARY_BIT;
+        value[0] = HWC_DISPLAY_PRIMARY_BIT;
         if (ctx->displays[HWC_DISPLAY_EXTERNAL].con)
-            *value |= HWC_DISPLAY_EXTERNAL_BIT;
+            value[0] |= HWC_DISPLAY_EXTERNAL_BIT;
         break;
     default:
         return -EINVAL; //unsupported query
@@ -359,7 +355,7 @@ static int hwc_query (struct hwc_composer_device_1* dev, int what, int *value)
     return 0;
 }
 
-static void hwc_registerProcs (struct hwc_composer_device_1* dev, 
+static void hwc_registerProcs (struct hwc_composer_device_1* dev,
         hwc_procs_t const* procs)
 {
     hwc_context_t *ctx = to_ctx(dev);
@@ -367,7 +363,7 @@ static void hwc_registerProcs (struct hwc_composer_device_1* dev,
     ctx->cb_procs = procs;
 }
 
-static int hwc_getDisplayConfigs (struct hwc_composer_device_1* dev, 
+static int hwc_getDisplayConfigs (struct hwc_composer_device_1* dev,
         int disp, uint32_t *configs, size_t *numConfigs)
 {
     if (*numConfigs == 0)
@@ -388,28 +384,27 @@ static int hwc_getDisplayAttributes (struct hwc_composer_device_1* dev, int disp
 
     if (disp != HWC_DISPLAY_PRIMARY || config != HWC_DEFAULT_CONFIG)
         return -EINVAL;
-    while (*attributes != HWC_DISPLAY_NO_ATTRIBUTE) {
-        switch (*attributes) {
+
+	for (int i = 0; attributes[i] != HWC_DISPLAY_NO_ATTRIBUTE;  i++) {
+            switch (attributes[i]) {
             case HWC_DISPLAY_VSYNC_PERIOD:
-                *values = 1000000000 / 60;
+                values[i] = 1000000000 / 60;
                 break;
             case HWC_DISPLAY_WIDTH:
-                *values = d->mode->hdisplay;
+                values[i] = d->mode->hdisplay;
                 break;
             case HWC_DISPLAY_HEIGHT:
-                *values = d->mode->vdisplay;
+                values[i] = d->mode->vdisplay;
                 break;
             case HWC_DISPLAY_DPI_X:
             case HWC_DISPLAY_DPI_Y:
-                *values = 240000;
+                values[i] = 240000;
                 break;
             default:
                 ALOGE("unknown display attribute %u\n", *attributes);
-                *values = 0;
+                values[i] = 0;
                 return -EINVAL;
         }
-        attributes++;
-        values++;
     }
     return 0;
 }
@@ -454,19 +449,19 @@ static int hwc_device_open(const struct hw_module_t *module, const char *name,
     ctx = (hwc_context_t *) calloc(1, sizeof(*ctx));
 
     /* Initialize the procs */
-    ctx->device.common.tag = HARDWARE_DEVICE_TAG;
-    ctx->device.common.version = HWC_DEVICE_API_VERSION_1_1;
-    ctx->device.common.module = (struct hw_module_t *)module;
-    ctx->device.common.close = hwc_device_close;
+    ctx->device.common.tag			= HARDWARE_DEVICE_TAG;
+    ctx->device.common.version		= HWC_DEVICE_API_VERSION_1_1;
+    ctx->device.common.module		= (struct hw_module_t *)module;
+    ctx->device.common.close		= hwc_device_close;
 
-    ctx->device.prepare = hwc_prepare;
-    ctx->device.set = hwc_set;
-    ctx->device.eventControl = hwc_eventControl;
-    ctx->device.blank = hwc_blank;
-    ctx->device.query = hwc_query;
-    ctx->device.registerProcs = hwc_registerProcs;
-    ctx->device.dump = hwc_dump;
-    ctx->device.getDisplayConfigs = hwc_getDisplayConfigs;
+    ctx->device.prepare				= hwc_prepare;
+    ctx->device.set					= hwc_set;
+    ctx->device.eventControl		= hwc_eventControl;
+    ctx->device.blank				= hwc_blank;
+    ctx->device.query				= hwc_query;
+    ctx->device.registerProcs		= hwc_registerProcs;
+    ctx->device.dump				= hwc_dump;
+    ctx->device.getDisplayConfigs	= hwc_getDisplayConfigs;
     ctx->device.getDisplayAttributes = hwc_getDisplayAttributes;
 
     /* Open Gralloc module */
@@ -494,29 +489,23 @@ static int hwc_device_open(const struct hw_module_t *module, const char *name,
 
     *device = &ctx->device.common;
 
-    /*ctx->ion_client = ion_open();
-    if (ctx->ion_client < 0)
-    {
-	   AERR("Could not open ion device for hwcomposer %d", ctx->ion_client);
-	   return -EINVAL;
-    }
-    ALOGE("ion_open success :%d\n", ctx->ion_client);*/
-
     return 0;
 }
 
 static struct hw_module_methods_t hwc_module_methods = {
-    .open = hwc_device_open
+	open: hwc_device_open
 };
 
 hwc_module_t HAL_MODULE_INFO_SYM = {
-    .common = {
-        .tag = HARDWARE_MODULE_TAG,
-        .module_api_version = HWC_MODULE_API_VERSION_0_1,
-        .hal_api_version = HARDWARE_HAL_API_VERSION,
-        .id = HWC_HARDWARE_MODULE_ID,
-        .name = "DRM/KMS hwcomposer module",
-        .author = "Bibhuti Panigrahi <bibhuti.panigrahi@linaro.org>",
-        .methods = &hwc_module_methods,
+	common: {
+		tag: HARDWARE_MODULE_TAG,
+		module_api_version: HWC_MODULE_API_VERSION_0_1,
+		hal_api_version: HARDWARE_HAL_API_VERSION,
+		id: HWC_HARDWARE_MODULE_ID,
+        name: "DRM/KMS hwcomposer module",
+        author: "Bibhuti Panigrahi <bibhuti.panigrahi@linaro.org>",
+        methods: &hwc_module_methods,
+		dso: 0,
+		reserved: {0},
     }
 };
