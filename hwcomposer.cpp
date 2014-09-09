@@ -83,7 +83,7 @@ static int init_display(hwc_context_t *ctx)
 	kms_display_t *d = &ctx->displays[HWC_DISPLAY_PRIMARY];
 	const char *modules[] = { "i915", "radeon", "nouveau", "vmwgfx", "omapdrm", "exynos", "tilcdc", "msm", "sti" };
 	int drm_fd;
-	int i, n;
+	unsigned int i, n;
 	drmModeResPtr resources;
 	drmModeConnector *connector;
 	drmModeEncoder *encoder;
@@ -192,6 +192,7 @@ static void *event_handler (void *arg)
     drmEventContext evctx = {
         .version = DRM_EVENT_CONTEXT_VERSION,
         .vblank_handler = vblank_handler,
+	.page_flip_handler = NULL,
     };
     struct pollfd pfds[1] = { { .fd = drm_fd, .events = POLLIN } };
 
@@ -216,38 +217,47 @@ static int update_display(hwc_context_t *ctx, int disp,
         hwc_display_contents_1_t *display)
 {
     int ret = 0;
-    int width = 0, height = 0;
+    uint32_t width = 0, height = 0;
     uint32_t fb = 0;
+    uint32_t bo[4] = { 0 };
+    uint32_t pitch[4] = { 0 };
+    uint32_t offset[4] = { 0 };
+    int nLayers, i;
+
     kms_display_t *kdisp = &ctx->displays[disp];
 
     if (!kdisp->con)
         return 0;
 
-    int nLayers = display->numHwLayers;
+    nLayers = display->numHwLayers;
     hwc_layer_1_t *layers = &display->hwLayers[0];
     hwc_layer_1_t *target = NULL;
-    for (int i = 0; i < nLayers; i++) {
+    for (i = 0; i < nLayers; i++) {
         if (layers[i].compositionType == HWC_FRAMEBUFFER_TARGET)
             target = &layers[i];
     }
+
     if (!target) {
         ALOGE("No target");
         return -EINVAL;
     }
 
-	private_handle_t const *hnd = reinterpret_cast<private_handle_t const *>(target->handle);
+    private_handle_t const *hnd = reinterpret_cast<private_handle_t const *>(target->handle);
 
-	if (!(hnd->flags & private_handle_t::PRIV_FLAGS_USES_ION)) {
-		AERR("private_handle_t isn't using ION, hnd->flags %d", hnd->flags);
-		return 0;
-	}
+    if (!(hnd->flags & private_handle_t::PRIV_FLAGS_USES_ION)) {
+	    AERR("private_handle_t isn't using ION, hnd->flags %d", hnd->flags);
+	    return 0;
+    }
 
     width = hnd->width;
     height = hnd->height;
 
-    uint32_t bo[4] = { hnd->drm_hnd };
-    uint32_t pitch[4] = { width * 4}; //stride
-    uint32_t offset[4] = { 0 };
+    ret = drmPrimeFDToHandle (ctx->drm_fd, hnd->share_fd, &bo[0]);
+    if (ret) {
+	ALOGE("Failed to get fd for DUMB buffer %s", strerror(errno));
+	return ret;
+    }
+    pitch[0] = width * 4; //stride
 
     ret = drmModeAddFB2(ctx->drm_fd, width, height, DRM_FORMAT_ARGB8888,
             bo, pitch, offset, &fb, 0);
@@ -259,13 +269,27 @@ static int update_display(hwc_context_t *ctx, int disp,
     ret = drmModeSetCrtc(ctx->drm_fd, kdisp->crtc_id, fb, 0, 0,
                 &kdisp->con->connector_id, 1, kdisp->mode);
     if (ret) {
-        ALOGE("cannot set CRTC for connector %u (%d): %m\n", kdisp->con->connector_id, ret);
+        ALOGE("cannot set CRTC for connector %u (%d)\n", kdisp->con->connector_id, ret);
         return ret;
     }
 
     /* Clean up */
-    if (kdisp->last_fb)
+    if (kdisp->last_fb) {
+	drmModeFBPtr lastFBPtr;
+	uint32_t handle;
+	struct drm_gem_close close_args;
+
+	lastFBPtr = drmModeGetFB(ctx->drm_fd, kdisp->last_fb);
+	handle = lastFBPtr->handle;
         drmModeRmFB(ctx->drm_fd, kdisp->last_fb);
+
+	close_args.handle = handle;
+	ret = drmIoctl(ctx->drm_fd, DRM_IOCTL_GEM_CLOSE, &close_args);
+	if(ret) {
+		ALOGE("Failed to release buffer (Handle = 0x%x): %d\n", handle, ret);
+		return ret;
+	}
+    }
     kdisp->last_fb = fb;
 
     return 0;
