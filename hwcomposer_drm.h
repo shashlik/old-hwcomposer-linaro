@@ -28,7 +28,7 @@
 #include "xf86drm.h"
 #include "xf86drmMode.h"
 
-#define HWC_DEFAULT_CONFIG 1
+#define HWC_DEFAULT_CONFIG 0
 #define to_ctx(dev) ((hwc_context_t *)dev)
 
 #ifndef ARRAY_SIZE

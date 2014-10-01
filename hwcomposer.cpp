@@ -52,6 +52,7 @@ static void drm_list_kms(hwc_context_t *ctx, drmModeResPtr resources,
 static int send_vsync_request(hwc_context_t *ctx, int disp)
 {
     int ret = 0;
+
     drmVBlank vbl;
 
     vbl.request.type = (drmVBlankSeqType) (DRM_VBLANK_RELATIVE | DRM_VBLANK_EVENT);
@@ -63,6 +64,7 @@ static int send_vsync_request(hwc_context_t *ctx, int disp)
     ret = drmWaitVBlank(ctx->drm_fd, &vbl);
     if (ret < 0)
         ALOGE("Failed to request vsync %d", errno);
+
     return ret;
 }
 
@@ -222,19 +224,16 @@ static int update_display(hwc_context_t *ctx, int disp,
     uint32_t bo[4] = { 0 };
     uint32_t pitch[4] = { 0 };
     uint32_t offset[4] = { 0 };
-    int nLayers, i;
+    hwc_layer_1_t *target = NULL;
 
     kms_display_t *kdisp = &ctx->displays[disp];
 
     if (!kdisp->con)
         return 0;
 
-    nLayers = display->numHwLayers;
-    hwc_layer_1_t *layers = &display->hwLayers[0];
-    hwc_layer_1_t *target = NULL;
-    for (i = 0; i < nLayers; i++) {
-        if (layers[i].compositionType == HWC_FRAMEBUFFER_TARGET)
-            target = &layers[i];
+    for (size_t i = 0; i < display->numHwLayers; i++) {
+        if (display->hwLayers[i].compositionType == HWC_FRAMEBUFFER_TARGET)
+            target = &display->hwLayers[i];
     }
 
     if (!target) {
@@ -246,7 +245,7 @@ static int update_display(hwc_context_t *ctx, int disp,
 
     if (!(hnd->flags & private_handle_t::PRIV_FLAGS_USES_ION)) {
 	    AERR("private_handle_t isn't using ION, hnd->flags %d", hnd->flags);
-	    return 0;
+	    return -EINVAL;
     }
 
     width = hnd->width;
@@ -307,11 +306,11 @@ static int hwc_prepare (struct hwc_composer_device_1 *dev,
         return 0;
 
     for (size_t i = 0; i < contents->numHwLayers; i++) {
-        hwc_layer_1_t *layers = &contents->hwLayers[i];
+        hwc_layer_1_t &layer = contents->hwLayers[i];
         //dump_layer(&layers[i]);
-        if (layers[i].compositionType == HWC_FRAMEBUFFER_TARGET)
+        if (layer.compositionType == HWC_FRAMEBUFFER_TARGET)
             continue;
-        layers[i].compositionType = HWC_FRAMEBUFFER;
+        layer.compositionType = HWC_FRAMEBUFFER;
     }
     return 0;
 }
@@ -319,23 +318,24 @@ static int hwc_prepare (struct hwc_composer_device_1 *dev,
 static int hwc_set (struct hwc_composer_device_1 *dev,
         size_t numDisplays, hwc_display_contents_1_t** displays)
 {
-    hwc_display_contents_1_t *contents = displays[HWC_DISPLAY_PRIMARY];
+    if (! numDisplays || ! displays)
+        return 0;
+
+    hwc_display_contents_1_t *content = displays[HWC_DISPLAY_PRIMARY];
     int ret = 0;
     hwc_context_t *ctx = to_ctx(dev);
     size_t i = 0;
 
-    if (! numDisplays || ! displays)
-        return 0;
-    /*for (i = 0; i < contents->numHwLayers; i++) {
-        dump_layer(&contents->hwLayers[i]);
-    }*/
-    for (i=0; i < numDisplays; i++) {
-        ret = update_display(ctx, i, displays[i]);
-        if (ret < 0)
-            break;
+    if (content) {
+	ret = update_display(ctx, HWC_DISPLAY_PRIMARY, content);
+	if (ret)
+		return ret;
     }
-    return ret;
 
+    content = displays[HWC_DISPLAY_EXTERNAL];
+    if (content)
+	return update_display(ctx, HWC_DISPLAY_EXTERNAL, content);
+    return ret;
 }
 
 static int hwc_eventControl (struct hwc_composer_device_1* dev, int disp,
@@ -393,7 +393,7 @@ static int hwc_getDisplayConfigs (struct hwc_composer_device_1* dev,
     if (*numConfigs == 0)
         return 0;
     if (disp == HWC_DISPLAY_PRIMARY) {
-        *configs = HWC_DEFAULT_CONFIG;
+        configs[0] = HWC_DEFAULT_CONFIG;
         *numConfigs = 1;
         return 0;
     }
@@ -409,7 +409,7 @@ static int hwc_getDisplayAttributes (struct hwc_composer_device_1* dev, int disp
     if (disp != HWC_DISPLAY_PRIMARY || config != HWC_DEFAULT_CONFIG)
         return -EINVAL;
 
-	for (int i = 0; attributes[i] != HWC_DISPLAY_NO_ATTRIBUTE;  i++) {
+    for (int i = 0; attributes[i] != HWC_DISPLAY_NO_ATTRIBUTE;  i++) {
             switch (attributes[i]) {
             case HWC_DISPLAY_VSYNC_PERIOD:
                 values[i] = 1000000000 / 60;
