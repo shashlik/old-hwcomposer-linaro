@@ -234,6 +234,16 @@ static int update_display(hwc_context_t *ctx, int disp,
     for (size_t i = 0; i < display->numHwLayers; i++) {
         if (display->hwLayers[i].compositionType == HWC_FRAMEBUFFER_TARGET)
             target = &display->hwLayers[i];
+
+	if (display->hwLayers[i].acquireFenceFd != -1) {
+	    ret = sync_wait(display->hwLayers[i].acquireFenceFd, 1000);
+            if(ret < 0) {
+                ALOGE("%s: sync_wait error!! error no = %d err str = %s",
+                                    __FUNCTION__, errno, strerror(errno));
+            }
+            close(display->hwLayers[i].acquireFenceFd);
+            display->hwLayers[i].acquireFenceFd = -1;
+	}
     }
 
     if (!target) {
@@ -307,7 +317,6 @@ static int hwc_prepare (struct hwc_composer_device_1 *dev,
 
     for (size_t i = 0; i < contents->numHwLayers; i++) {
         hwc_layer_1_t &layer = contents->hwLayers[i];
-        //dump_layer(&layers[i]);
         if (layer.compositionType == HWC_FRAMEBUFFER_TARGET)
             continue;
         layer.compositionType = HWC_FRAMEBUFFER;
