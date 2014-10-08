@@ -80,12 +80,11 @@ static void vblank_handler(int fd, unsigned int frame, unsigned int sec,
     }
 }
 
-static int init_display(hwc_context_t *ctx)
+static int init_display(hwc_context_t *ctx, int disp)
 {
-	kms_display_t *d = &ctx->displays[HWC_DISPLAY_PRIMARY];
+	kms_display_t *d = &ctx->displays[disp];
 	const char *modules[] = { "i915", "radeon", "nouveau", "vmwgfx", "omapdrm", "exynos", "tilcdc", "msm", "sti" };
 	int drm_fd;
-	unsigned int i, n;
 	drmModeResPtr resources;
 	drmModeConnector *connector;
 	drmModeEncoder *encoder;
@@ -93,18 +92,24 @@ static int init_display(hwc_context_t *ctx)
 	uint32_t possible_crtcs;
 	private_module_t *m = NULL;
 
-	 /* Open DRM device */
-	for (i = 0; i < ARRAY_SIZE(modules); i++) {
-		drm_fd = drmOpen(modules[i], NULL);
-		if (drm_fd >= 0) {
-			ALOGI("Open %s drm device (%d)\n", modules[i], drm_fd);
-			break;
+	/* open drm only once for all the displays */
+	if (ctx->drm_fd < 0) {
+	   /* Open DRM device */
+	   for (unsigned int i = 0; i < ARRAY_SIZE(modules); i++) {
+	       drm_fd = drmOpen(modules[i], NULL);
+	         if (drm_fd >= 0) {
+	            ALOGI("Open %s drm device (%d)\n", modules[i], drm_fd);
+		    break;
 		}
-	}
-
-	if (drm_fd < 0) {
+	   }
+	   if (drm_fd < 0) {
 		ALOGE("Failed to open DRM: %s\n", strerror(errno));
 		return -EINVAL;
+	   }
+
+	   ctx->drm_fd = drm_fd;
+	} else {
+	   drm_fd = ctx->drm_fd;
 	}
 
 	resources = drmModeGetResources(drm_fd);
@@ -113,9 +118,9 @@ static int init_display(hwc_context_t *ctx)
 		goto close;
 	}
 
-	connector = drmModeGetConnector(drm_fd, resources->connectors[HWC_DISPLAY_PRIMARY]);
+	connector = drmModeGetConnector(drm_fd, resources->connectors[disp]);
 	if (!connector) {
-		ALOGE("No connector for DISPLAY %d\n", HWC_DISPLAY_PRIMARY);
+		ALOGE("No connector for DISPLAY %d\n", disp);
 		goto free_ressources;
 	}
 
@@ -127,26 +132,12 @@ static int init_display(hwc_context_t *ctx)
 		goto free_connector;
 	}
 
-	i = 0;
-	n = encoder->possible_crtcs;
-	while (!(n & 1)) {
-		n >>= 1;
-		i++;
-	}
-
-	ctx->drm_fd = drm_fd;
-	{
-		hw_module_t *pmodule = NULL;
-		private_module_t *m = NULL;
-		hw_get_module(GRALLOC_HARDWARE_MODULE_ID, (const hw_module_t **)&pmodule);
-		m = reinterpret_cast<private_module_t *>(pmodule);
-		ALOGI("Set drm fd (%d) to gralloc", drm_fd);
-		m->drm_fd = drm_fd;
-	}
+	if (!(encoder->possible_crtcs & (1 << disp)))
+		goto free_encoder;
 
 	d->con = connector;
 	d->enc = encoder;
-	d->crtc_id = resources->crtcs[i];
+	d->crtc_id = resources->crtcs[disp];
 	d->mode = mode;
 	d->evctx.version = DRM_EVENT_CONTEXT_VERSION;
 	d->evctx.vblank_handler = vblank_handler;
@@ -154,12 +145,13 @@ static int init_display(hwc_context_t *ctx)
 
 	return 0;
 
+free_encoder:
+	drmModeFreeEncoder(encoder);
 free_connector:
 	drmModeFreeConnector(connector);
 free_ressources:
 	drmModeFreeResources(resources);
 close:
-	drmClose(drm_fd);
 	return -1;
 }
 
@@ -196,7 +188,7 @@ static void *event_handler (void *arg)
         .vblank_handler = vblank_handler,
 	.page_flip_handler = NULL,
     };
-    struct pollfd pfds[1] = { { .fd = drm_fd, .events = POLLIN } };
+    struct pollfd pfds[1] = { { .fd = drm_fd, .events = POLLIN, .revents = POLLERR} };
 
     while (1) {
         int ret = poll(pfds, ARRAY_SIZE(pfds), 60000);
@@ -304,26 +296,6 @@ static int update_display(hwc_context_t *ctx, int disp,
     return 0;
 }
 
-
-static int hwc_prepare (struct hwc_composer_device_1 *dev,
-        size_t numDisplays, hwc_display_contents_1_t** displays)
-{
-    hwc_display_contents_1_t *contents = displays[HWC_DISPLAY_PRIMARY];
-
-    if (! numDisplays || ! displays)
-        return 0;
-    if ((contents->flags & HWC_GEOMETRY_CHANGED) == 0)
-        return 0;
-
-    for (size_t i = 0; i < contents->numHwLayers; i++) {
-        hwc_layer_1_t &layer = contents->hwLayers[i];
-        if (layer.compositionType == HWC_FRAMEBUFFER_TARGET)
-            continue;
-        layer.compositionType = HWC_FRAMEBUFFER;
-    }
-    return 0;
-}
-
 static int hwc_set (struct hwc_composer_device_1 *dev,
         size_t numDisplays, hwc_display_contents_1_t** displays)
 {
@@ -347,10 +319,46 @@ static int hwc_set (struct hwc_composer_device_1 *dev,
     return ret;
 }
 
+static int prepare_display (hwc_context_t *ctx, int disp,
+        hwc_display_contents_1_t *content)
+{
+    for (size_t i = 0; i < content->numHwLayers; i++) {
+        hwc_layer_1_t &layer = content->hwLayers[i];
+        if (layer.compositionType == HWC_FRAMEBUFFER_TARGET)
+            continue;
+        layer.compositionType = HWC_FRAMEBUFFER;
+    }
+
+    return 0;
+}
+
+static int hwc_prepare (struct hwc_composer_device_1 *dev,
+        size_t numDisplays, hwc_display_contents_1_t** displays)
+{
+    if (! numDisplays || ! displays)
+        return 0;
+
+    hwc_display_contents_1_t *content = displays[HWC_DISPLAY_PRIMARY];
+    hwc_context_t *ctx = to_ctx(dev);
+    int ret = 0;
+
+    if (content) {
+	ret = prepare_display (ctx, HWC_DISPLAY_PRIMARY, content);
+	if (ret)
+		return ret;
+    }
+
+    content = displays[HWC_DISPLAY_EXTERNAL];
+    if (content)
+	ret = prepare_display (ctx, HWC_DISPLAY_EXTERNAL, content);
+
+    return ret;
+}
+
 static int hwc_eventControl (struct hwc_composer_device_1* dev, int disp,
         int event, int enabled)
 {
-	hwc_context_t *ctx = to_ctx(dev);
+    hwc_context_t *ctx = to_ctx(dev);
 
     if (disp < 0 || disp >= HWC_NUM_DISPLAY_TYPES)
         return -EINVAL;
@@ -370,6 +378,7 @@ static int hwc_query (struct hwc_composer_device_1* dev, int what, int *value)
 {
     hwc_context_t *ctx = to_ctx(dev);
     int refreshRate = 60;
+
     switch (what) {
     case HWC_BACKGROUND_LAYER_SUPPORTED:
         value[0] = 1;   //support the background layer
@@ -401,7 +410,8 @@ static int hwc_getDisplayConfigs (struct hwc_composer_device_1* dev,
 {
     if (*numConfigs == 0)
         return 0;
-    if (disp == HWC_DISPLAY_PRIMARY) {
+
+    if ((disp == HWC_DISPLAY_PRIMARY) || (disp == HWC_DISPLAY_EXTERNAL)) {
         configs[0] = HWC_DEFAULT_CONFIG;
         *numConfigs = 1;
         return 0;
@@ -415,7 +425,7 @@ static int hwc_getDisplayAttributes (struct hwc_composer_device_1* dev, int disp
     hwc_context_t *ctx = to_ctx(dev);
     kms_display_t *d = &ctx->displays[disp];
 
-    if (disp != HWC_DISPLAY_PRIMARY || config != HWC_DEFAULT_CONFIG)
+    if (config != HWC_DEFAULT_CONFIG)
         return -EINVAL;
 
     for (int i = 0; attributes[i] != HWC_DISPLAY_NO_ATTRIBUTE;  i++) {
@@ -430,8 +440,14 @@ static int hwc_getDisplayAttributes (struct hwc_composer_device_1* dev, int disp
                 values[i] = d->mode->vdisplay;
                 break;
             case HWC_DISPLAY_DPI_X:
+		values[i] = 0;
+		if (d->con->mmWidth)
+			values[i] = (d->mode->hdisplay * 25400) / d->con->mmWidth;
+		break;
             case HWC_DISPLAY_DPI_Y:
-                values[i] = 240000;
+		values[i] = 0;
+		if (d->con->mmHeight)
+			values[i] = (d->mode->vdisplay * 25400) / d->con->mmHeight;
                 break;
             default:
                 ALOGE("unknown display attribute %u\n", *attributes);
@@ -461,10 +477,20 @@ static int hwc_device_close(struct hw_device_t *dev)
         return 0;
 
     destroy_display(ctx->drm_fd, &ctx->displays[HWC_DISPLAY_PRIMARY]);
+    destroy_display(ctx->drm_fd, &ctx->displays[HWC_DISPLAY_EXTERNAL]);
     drmClose(ctx->drm_fd);
     free(ctx);
 
     return 0;
+}
+
+static void init_gralloc(int drm_fd)
+{
+    hw_module_t *pmodule = NULL;
+    private_module_t *m = NULL;
+    hw_get_module(GRALLOC_HARDWARE_MODULE_ID, (const hw_module_t **)&pmodule);
+    m = reinterpret_cast<private_module_t *>(pmodule);
+    m->drm_fd = drm_fd;
 }
 
 static int hwc_device_open(const struct hw_module_t *module, const char *name,
@@ -482,20 +508,22 @@ static int hwc_device_open(const struct hw_module_t *module, const char *name,
     ctx = (hwc_context_t *) calloc(1, sizeof(*ctx));
 
     /* Initialize the procs */
-    ctx->device.common.tag			= HARDWARE_DEVICE_TAG;
+    ctx->device.common.tag		= HARDWARE_DEVICE_TAG;
     ctx->device.common.version		= HWC_DEVICE_API_VERSION_1_1;
     ctx->device.common.module		= (struct hw_module_t *)module;
     ctx->device.common.close		= hwc_device_close;
 
-    ctx->device.prepare				= hwc_prepare;
-    ctx->device.set					= hwc_set;
+    ctx->device.prepare			= hwc_prepare;
+    ctx->device.set			= hwc_set;
     ctx->device.eventControl		= hwc_eventControl;
-    ctx->device.blank				= hwc_blank;
-    ctx->device.query				= hwc_query;
+    ctx->device.blank			= hwc_blank;
+    ctx->device.query			= hwc_query;
     ctx->device.registerProcs		= hwc_registerProcs;
-    ctx->device.dump				= hwc_dump;
+    ctx->device.dump			= hwc_dump;
     ctx->device.getDisplayConfigs	= hwc_getDisplayConfigs;
-    ctx->device.getDisplayAttributes = hwc_getDisplayAttributes;
+    ctx->device.getDisplayAttributes	= hwc_getDisplayAttributes;
+
+    ctx->drm_fd = -1;
 
     /* Open Gralloc module */
     ret = hw_get_module(GRALLOC_HARDWARE_MODULE_ID,
@@ -505,10 +533,15 @@ static int hwc_device_open(const struct hw_module_t *module, const char *name,
         return ret;
     }
 
-    ret = init_display(ctx);
+    ret = init_display(ctx, HWC_DISPLAY_PRIMARY);
     if (ret) {
+	if (ctx->drm_fd != -1)
+	  drmClose(ctx->drm_fd);
         return -EINVAL;
     }
+    init_display(ctx, HWC_DISPLAY_EXTERNAL);
+
+    init_gralloc(ctx->drm_fd);
 
     pthread_attr_t attrs;
     pthread_attr_init(&attrs);
@@ -536,7 +569,7 @@ hwc_module_t HAL_MODULE_INFO_SYM = {
 		hal_api_version: HARDWARE_HAL_API_VERSION,
 		id: HWC_HARDWARE_MODULE_ID,
         name: "DRM/KMS hwcomposer module",
-        author: "Bibhuti Panigrahi <bibhuti.panigrahi@linaro.org>",
+        author: "Benjamin Gaignard <benjamin.gaignard@linaro.org>",
         methods: &hwc_module_methods,
 		dso: 0,
 		reserved: {0},
