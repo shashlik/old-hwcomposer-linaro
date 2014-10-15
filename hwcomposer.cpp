@@ -1,54 +1,29 @@
 #include <hwcomposer_drm.h>
 #include "gralloc_priv.h"
 
-struct hwc_context;
+struct hwc_fourcc {
+    int hwc_format;
+    unsigned int fourcc;
+};
 
-static void kms_plane_print (int fd, uint32_t id)
+static const struct hwc_fourcc to_fourcc[] = {
+    {HAL_PIXEL_FORMAT_RGBA_8888, DRM_FORMAT_ARGB8888},
+    {HAL_PIXEL_FORMAT_RGBX_8888, DRM_FORMAT_XRGB8888},
+    {HAL_PIXEL_FORMAT_BGRA_8888, DRM_FORMAT_BGRA8888},
+    {HAL_PIXEL_FORMAT_RGB_888,   DRM_FORMAT_RGB888},
+    {HAL_PIXEL_FORMAT_RGB_565,   DRM_FORMAT_RGB565},
+    {HAL_PIXEL_FORMAT_YV12,      DRM_FORMAT_NV12},
+};
+
+static unsigned int hnd_to_fourcc(private_handle_t const *hnd)
 {
-    char buffer[1024];
-    int i;
-    drmModePlanePtr plane = drmModeGetPlane(fd, id);
-    if (! plane) {
-        ALOGE("Failed to get plane %d: %s\n",id, strerror(errno));
-        return;
-    }
+    for (unsigned int i = 0; i < ARRAY_SIZE(to_fourcc); i++)
+	if (to_fourcc[i].hwc_format == hnd->format)
+	   return to_fourcc[i].fourcc;
 
-    ALOGI("\t\t%02d: FB %02d (%4dx%4d), CRTC %02d (%4dx%4d),"
-        "Possible CRTCs 0x%02x\n", plane->plane_id, plane->fb_id,
-        plane->crtc_x, plane->crtc_y, plane->crtc_id, plane->x,
-        plane->y, plane->possible_crtcs);
-    for (i = 0; i < (int)plane->count_formats; i++)
-        sprintf(buffer + 6 * i, "%c%c%c%c,", plane->formats[i] & 0xFF,
-                (plane->formats[i] >> 8) & 0xFF,
-                (plane->formats[i] >> 16) & 0xFF,
-                (plane->formats[i] >> 24) & 0xFF);
-    ALOGI("\t\t Supported Formats:%s\n",buffer);
-    drmModeFreePlane(plane);
+    return 0;
 }
 
-static void drm_list_kms(hwc_context_t *ctx, drmModeResPtr resources,
-	    drmModePlaneResPtr planes)
-{
-    int i;
-    ALOGI("KMS Resources:\n");
-    ALOGI("\t Dimensions: (%d,%d)->(%d,%d)\n",	resources->min_width, resources->min_height,
-	                resources->max_width, resources->max_height);
-    ALOGI("\tFBs:\n");
-    for (i = 0; i < resources->count_fbs; i++)
-        ALOGI("\t\t%d\n", resources->fbs[i]);
-    ALOGI("\tPlanes:\n");
-    for (i = 0; i < (int)planes->count_planes; i++)
-	    kms_plane_print(ctx->drm_fd, planes->planes[i]);
-    ALOGI("\tCRTCs:\n");
-    for (i = 0; i < resources->count_crtcs; i++)
-	    ALOGI("\t\t%d\n", resources->crtcs[i]);
-    ALOGI("\tEncoders:\n");
-    for (i = 0; i < resources->count_encoders; i++)
-        ALOGI("\t\t%d\n", resources->encoders[i]);
-    ALOGI("\tConnectors:\n");
-    for (i = 0; i < resources->count_connectors; i++)
-        ALOGI("\t\t%d\n", resources->connectors[i]);
-}
 static int send_vsync_request(hwc_context_t *ctx, int disp)
 {
     int ret = 0;
@@ -143,6 +118,8 @@ static int init_display(hwc_context_t *ctx, int disp)
 	d->evctx.vblank_handler = vblank_handler;
 	d->ctx = ctx;
 
+	drmModeFreeResources(resources);
+
 	return 0;
 
 free_encoder:
@@ -207,6 +184,51 @@ static void *event_handler (void *arg)
     return NULL;
 }
 
+static bool is_display_connected(hwc_context_t *ctx, int disp)
+{
+    if ((disp != HWC_DISPLAY_PRIMARY) && (disp !=HWC_DISPLAY_EXTERNAL))
+	return false;
+
+    if (!ctx->displays[disp].con)
+	return false;
+
+    if (ctx->displays[disp].con->connection == DRM_MODE_CONNECTED)
+	return true;
+
+    return false;
+}
+
+static bool set_zorder(hwc_context_t *ctx, int plane_id, int zorder)
+{
+    drmModeObjectPropertiesPtr properties = NULL;
+    drmModePropertyPtr property = NULL;
+    int i, ret;
+
+    properties = drmModeObjectGetProperties(ctx->drm_fd, plane_id, DRM_MODE_OBJECT_PLANE);
+
+    if (!properties)
+	return false;
+
+    for (i = 0; i < (int) properties->count_props; ++i) {
+	property = drmModeGetProperty(ctx->drm_fd, properties->props[i]);
+	if (!property)
+	   continue;
+	if (strcmp(property->name, "zpos") == 0)
+	   break;
+	drmModeFreeProperty(property);
+    }
+
+    if (i == (int)properties->count_props)
+	goto free_properties;
+
+    ret = drmModeObjectSetProperty(ctx->drm_fd, plane_id, DRM_MODE_OBJECT_PLANE, property->prop_id, zorder);
+    drmModeFreeProperty(property);
+
+free_properties:
+    drmModeFreeObjectProperties(properties);
+    return !!ret;
+}
+
 static int update_display(hwc_context_t *ctx, int disp,
         hwc_display_contents_1_t *display)
 {
@@ -220,12 +242,18 @@ static int update_display(hwc_context_t *ctx, int disp,
 
     kms_display_t *kdisp = &ctx->displays[disp];
 
-    if (!kdisp->con)
+    if (!is_display_connected(ctx, disp))
         return 0;
 
     for (size_t i = 0; i < display->numHwLayers; i++) {
-        if (display->hwLayers[i].compositionType == HWC_FRAMEBUFFER_TARGET)
-            target = &display->hwLayers[i];
+	hwc_layer_1_t *target = &display->hwLayers[i];
+	private_handle_t const *hnd = reinterpret_cast<private_handle_t const *>(target->handle);
+	unsigned int fourcc = hnd_to_fourcc(hnd);
+
+	if (!(hnd->flags & private_handle_t::PRIV_FLAGS_USES_ION)) {
+	    AERR("private_handle_t isn't using ION, hnd->flags %d", hnd->flags);
+	    return -EINVAL;
+	}
 
 	if (display->hwLayers[i].acquireFenceFd != -1) {
 	    ret = sync_wait(display->hwLayers[i].acquireFenceFd, 1000);
@@ -236,42 +264,49 @@ static int update_display(hwc_context_t *ctx, int disp,
             close(display->hwLayers[i].acquireFenceFd);
             display->hwLayers[i].acquireFenceFd = -1;
 	}
-    }
 
-    if (!target) {
-        ALOGE("No target");
-        return -EINVAL;
-    }
+	width = hnd->width;
+	height = hnd->height;
 
-    private_handle_t const *hnd = reinterpret_cast<private_handle_t const *>(target->handle);
+	ret = drmPrimeFDToHandle (ctx->drm_fd, hnd->share_fd, &bo[0]);
+	if (ret) {
+		ALOGE("Failed to get fd for DUMB buffer %s", strerror(errno));
+		return ret;
+	}
+	pitch[0] = width * 4; //stride
 
-    if (!(hnd->flags & private_handle_t::PRIV_FLAGS_USES_ION)) {
-	    AERR("private_handle_t isn't using ION, hnd->flags %d", hnd->flags);
-	    return -EINVAL;
-    }
+	/* force format for framebuffer because GPU claim use RGBA */
+	if (display->hwLayers[i].compositionType == HWC_FRAMEBUFFER_TARGET)
+	    fourcc = DRM_FORMAT_ARGB8888;
 
-    width = hnd->width;
-    height = hnd->height;
-
-    ret = drmPrimeFDToHandle (ctx->drm_fd, hnd->share_fd, &bo[0]);
-    if (ret) {
-	ALOGE("Failed to get fd for DUMB buffer %s", strerror(errno));
-	return ret;
-    }
-    pitch[0] = width * 4; //stride
-
-    ret = drmModeAddFB2(ctx->drm_fd, width, height, DRM_FORMAT_ARGB8888,
+	ret = drmModeAddFB2(ctx->drm_fd, width, height, fourcc,
             bo, pitch, offset, &fb, 0);
-    if (ret) {
-        ALOGE("cannot create framebuffer (%d): %m\n",errno);
-        return ret;
-    }
+	if (ret) {
+		ALOGE("cannot create framebuffer (%d): %m\n",errno);
+		return ret;
+	}
 
-    ret = drmModeSetCrtc(ctx->drm_fd, kdisp->crtc_id, fb, 0, 0,
-                &kdisp->con->connector_id, 1, kdisp->mode);
-    if (ret) {
-        ALOGE("cannot set CRTC for connector %u (%d)\n", kdisp->con->connector_id, ret);
-        return ret;
+	if (display->hwLayers[i].compositionType == HWC_FRAMEBUFFER_TARGET) {
+		drmModeSetCrtc(ctx->drm_fd, kdisp->crtc_id, fb, 0, 0,
+			&kdisp->con->connector_id, 1, kdisp->mode);
+	}
+
+	if (display->hwLayers[i].compositionType == HWC_OVERLAY) {
+		int plane_id = hnd->plane_id;
+
+		set_zorder(ctx, plane_id, i + 1);
+
+		drmModeSetPlane(ctx->drm_fd, plane_id, kdisp->crtc_id, fb, 0,
+				target->displayFrame.left,
+				target->displayFrame.top,
+				target->displayFrame.right - target->displayFrame.left,
+				target->displayFrame.bottom - target->displayFrame.top,
+				target->sourceCrop.left,
+				target->sourceCrop.top,
+				(target->sourceCrop.right - target->sourceCrop.left) << 16,
+				(target->sourceCrop.bottom - target->sourceCrop.top) << 16);
+
+	}
     }
 
     /* Clean up */
@@ -319,14 +354,82 @@ static int hwc_set (struct hwc_composer_device_1 *dev,
     return ret;
 }
 
+static int find_plane(hwc_context_t *ctx, int disp, private_handle_t *hnd)
+{
+   unsigned int i, j, ret = 0;
+   drmModePlaneResPtr plane_res;
+   int drm_fd = ctx->drm_fd;
+   unsigned int fourcc = hnd_to_fourcc(hnd);
+
+   if (!fourcc)
+	return ret;
+
+   plane_res = drmModeGetPlaneResources(drm_fd);
+
+   for (i = 0; i < plane_res->count_planes && !ret; i++) {
+	drmModePlanePtr plane;
+
+	plane = drmModeGetPlane(drm_fd, plane_res->planes[i]);
+
+	if (!plane)
+		continue;
+
+	if (!(plane->possible_crtcs & (1 << disp))) {
+		drmModeFreePlane(plane);
+		continue;
+	}
+
+	if (ctx->used_planes & (1 << i)) {
+		drmModeFreePlane(plane);
+		continue;
+	}
+
+	for (j =0; j < plane->count_formats && !ret; j++) {
+	    if (plane->formats[j] == fourcc) {
+		ret = plane->plane_id;
+		hnd->plane_id = plane->plane_id;
+		ctx->used_planes |= 1 << i;
+	    }
+	}
+
+	drmModeFreePlane(plane);
+   }
+
+   drmModeFreePlaneResources (plane_res);
+
+   return ret;
+}
+
 static int prepare_display (hwc_context_t *ctx, int disp,
         hwc_display_contents_1_t *content)
 {
-    for (size_t i = 0; i < content->numHwLayers; i++) {
+    kms_display_t *d = &ctx->displays[disp];
+    bool target_framebuffer = false;
+
+    if (!is_display_connected(ctx, disp))
+	return 0;
+
+    for (int i = content->numHwLayers - 1;  i >= 0; i--) {
         hwc_layer_1_t &layer = content->hwLayers[i];
+	private_handle_t *hnd = (private_handle_t *)layer.handle;
+	int plane_id;
+
         if (layer.compositionType == HWC_FRAMEBUFFER_TARGET)
             continue;
+
+	if (target_framebuffer) {
+	   layer.compositionType = HWC_FRAMEBUFFER;
+	   continue;
+	}
+
+	plane_id = find_plane(ctx, disp, hnd);
+	if (plane_id) {
+	   layer.compositionType = HWC_OVERLAY;
+	   continue;
+	}
+
         layer.compositionType = HWC_FRAMEBUFFER;
+	target_framebuffer = true;
     }
 
     return 0;
@@ -341,6 +444,8 @@ static int hwc_prepare (struct hwc_composer_device_1 *dev,
     hwc_display_contents_1_t *content = displays[HWC_DISPLAY_PRIMARY];
     hwc_context_t *ctx = to_ctx(dev);
     int ret = 0;
+
+    ctx->used_planes = 0;
 
     if (content) {
 	ret = prepare_display (ctx, HWC_DISPLAY_PRIMARY, content);
@@ -387,8 +492,9 @@ static int hwc_query (struct hwc_composer_device_1* dev, int what, int *value)
         value[0] = 1000000000 / refreshRate;
         break;
    case HWC_DISPLAY_TYPES_SUPPORTED:
-        value[0] = HWC_DISPLAY_PRIMARY_BIT;
-        if (ctx->displays[HWC_DISPLAY_EXTERNAL].con)
+	if (is_display_connected(ctx, HWC_DISPLAY_PRIMARY))
+	    value[0] = HWC_DISPLAY_PRIMARY_BIT;
+        if (is_display_connected(ctx, HWC_DISPLAY_EXTERNAL))
             value[0] |= HWC_DISPLAY_EXTERNAL_BIT;
         break;
     default:
@@ -408,10 +514,12 @@ static void hwc_registerProcs (struct hwc_composer_device_1* dev,
 static int hwc_getDisplayConfigs (struct hwc_composer_device_1* dev,
         int disp, uint32_t *configs, size_t *numConfigs)
 {
+    hwc_context_t *ctx = to_ctx(dev);
+
     if (*numConfigs == 0)
         return 0;
 
-    if ((disp == HWC_DISPLAY_PRIMARY) || (disp == HWC_DISPLAY_EXTERNAL)) {
+    if (is_display_connected(ctx, disp)) {
         configs[0] = HWC_DEFAULT_CONFIG;
         *numConfigs = 1;
         return 0;
@@ -424,6 +532,9 @@ static int hwc_getDisplayAttributes (struct hwc_composer_device_1* dev, int disp
 {
     hwc_context_t *ctx = to_ctx(dev);
     kms_display_t *d = &ctx->displays[disp];
+
+    if (!is_display_connected(ctx, disp))
+	return -EINVAL;
 
     if (config != HWC_DEFAULT_CONFIG)
         return -EINVAL;
@@ -478,6 +589,7 @@ static int hwc_device_close(struct hw_device_t *dev)
 
     destroy_display(ctx->drm_fd, &ctx->displays[HWC_DISPLAY_PRIMARY]);
     destroy_display(ctx->drm_fd, &ctx->displays[HWC_DISPLAY_EXTERNAL]);
+
     drmClose(ctx->drm_fd);
     free(ctx);
 
@@ -539,7 +651,10 @@ static int hwc_device_open(const struct hw_module_t *module, const char *name,
 	  drmClose(ctx->drm_fd);
         return -EINVAL;
     }
+
     init_display(ctx, HWC_DISPLAY_EXTERNAL);
+
+    ctx->used_planes = 0;
 
     init_gralloc(ctx->drm_fd);
 

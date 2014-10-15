@@ -65,6 +65,10 @@ typedef struct hwc_context {
     int32_t xdpi;
     int32_t ydpi;
     int32_t vsync_period;
+
+    /* drm planes management*/
+    uint64_t used_planes;
+
 } hwc_context_t;
 
 #endif //#ifndef ANDROID_HWC_H_
