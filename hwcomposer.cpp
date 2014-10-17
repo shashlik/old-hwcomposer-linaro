@@ -232,7 +232,7 @@ free_properties:
 static int update_display(hwc_context_t *ctx, int disp,
         hwc_display_contents_1_t *display)
 {
-    int ret = 0;
+    int ret = 0, zorder = 1;
     uint32_t width = 0, height = 0;
     uint32_t fb = 0;
     uint32_t bo[4] = { 0 };
@@ -246,57 +246,72 @@ static int update_display(hwc_context_t *ctx, int disp,
         return 0;
 
     for (size_t i = 0; i < display->numHwLayers; i++) {
-	hwc_layer_1_t *target = &display->hwLayers[i];
-	private_handle_t const *hnd = reinterpret_cast<private_handle_t const *>(target->handle);
-	unsigned int fourcc = hnd_to_fourcc(hnd);
+		hwc_layer_1_t *target = &display->hwLayers[i];
 
-	if (!(hnd->flags & private_handle_t::PRIV_FLAGS_USES_ION)) {
-	    AERR("private_handle_t isn't using ION, hnd->flags %d", hnd->flags);
-	    return -EINVAL;
-	}
+		if (!target)
+			continue;
 
-	if (display->hwLayers[i].acquireFenceFd != -1) {
-	    ret = sync_wait(display->hwLayers[i].acquireFenceFd, 1000);
+		private_handle_t const *hnd = reinterpret_cast<private_handle_t const *>(target->handle);
+
+		if (!hnd)
+			continue;
+
+		if ((display->hwLayers[i].compositionType != HWC_FRAMEBUFFER_TARGET) && (display->hwLayers[i].compositionType != HWC_OVERLAY))
+			continue;
+
+		unsigned int fourcc = hnd_to_fourcc(hnd);
+
+		if (!fourcc)
+			return -EINVAL;
+
+		if (!(hnd->flags & private_handle_t::PRIV_FLAGS_USES_ION)) {
+			AERR("private_handle_t isn't using ION, hnd->flags %d", hnd->flags);
+			return -EINVAL;
+		}
+
+		if (target->acquireFenceFd != -1) {
+			ret = sync_wait(target->acquireFenceFd, 1000);
             if(ret < 0) {
                 ALOGE("%s: sync_wait error!! error no = %d err str = %s",
                                     __FUNCTION__, errno, strerror(errno));
             }
-            close(display->hwLayers[i].acquireFenceFd);
-            display->hwLayers[i].acquireFenceFd = -1;
-	}
+            close(target->acquireFenceFd);
+            target->acquireFenceFd = -1;
+		}
 
-	width = hnd->width;
-	height = hnd->height;
+		width = hnd->width;
+		height = hnd->height;
 
-	ret = drmPrimeFDToHandle (ctx->drm_fd, hnd->share_fd, &bo[0]);
-	if (ret) {
-		ALOGE("Failed to get fd for DUMB buffer %s", strerror(errno));
-		return ret;
-	}
-	pitch[0] = width * 4; //stride
+		ret = drmPrimeFDToHandle (ctx->drm_fd, hnd->share_fd, &bo[0]);
+		if (ret) {
+			ALOGE("Failed to get fd for DUMB buffer %s", strerror(errno));
+			return ret;
+		}
+		pitch[0] = width * 4; //stride
 
-	/* force format for framebuffer because GPU claim use RGBA */
-	if (display->hwLayers[i].compositionType == HWC_FRAMEBUFFER_TARGET)
-	    fourcc = DRM_FORMAT_ARGB8888;
+		/* force format for framebuffer because GPU claim use RGBA */
+		if (display->hwLayers[i].compositionType == HWC_FRAMEBUFFER_TARGET)
+			fourcc = DRM_FORMAT_ARGB8888;
 
-	ret = drmModeAddFB2(ctx->drm_fd, width, height, fourcc,
+		ret = drmModeAddFB2(ctx->drm_fd, width, height, fourcc,
             bo, pitch, offset, &fb, 0);
-	if (ret) {
-		ALOGE("cannot create framebuffer (%d): %m\n",errno);
-		return ret;
-	}
+		if (ret) {
+			ALOGE("cannot create framebuffer (%d): %m\n",errno);
+			return ret;
+		}
 
-	if (display->hwLayers[i].compositionType == HWC_FRAMEBUFFER_TARGET) {
-		drmModeSetCrtc(ctx->drm_fd, kdisp->crtc_id, fb, 0, 0,
-			&kdisp->con->connector_id, 1, kdisp->mode);
-	}
+		if (display->hwLayers[i].compositionType == HWC_FRAMEBUFFER_TARGET) {
+			drmModeSetCrtc(ctx->drm_fd, kdisp->crtc_id, fb, 0, 0,
+				&kdisp->con->connector_id, 1, kdisp->mode);
+			zorder++;
+		}
 
-	if (display->hwLayers[i].compositionType == HWC_OVERLAY) {
-		int plane_id = hnd->plane_id;
+		if (display->hwLayers[i].compositionType == HWC_OVERLAY) {
+			int plane_id = hnd->plane_id;
 
-		set_zorder(ctx, plane_id, i + 1);
+			set_zorder(ctx, plane_id, zorder++);
 
-		drmModeSetPlane(ctx->drm_fd, plane_id, kdisp->crtc_id, fb, 0,
+			drmModeSetPlane(ctx->drm_fd, plane_id, kdisp->crtc_id, fb, 0,
 				target->displayFrame.left,
 				target->displayFrame.top,
 				target->displayFrame.right - target->displayFrame.left,
@@ -306,7 +321,7 @@ static int update_display(hwc_context_t *ctx, int disp,
 				(target->sourceCrop.right - target->sourceCrop.left) << 16,
 				(target->sourceCrop.bottom - target->sourceCrop.top) << 16);
 
-	}
+		}
     }
 
     /* Clean up */
@@ -350,7 +365,8 @@ static int hwc_set (struct hwc_composer_device_1 *dev,
 
     content = displays[HWC_DISPLAY_EXTERNAL];
     if (content)
-	return update_display(ctx, HWC_DISPLAY_EXTERNAL, content);
+	    return update_display(ctx, HWC_DISPLAY_EXTERNAL, content);
+
     return ret;
 }
 
@@ -407,29 +423,32 @@ static int prepare_display (hwc_context_t *ctx, int disp,
     bool target_framebuffer = false;
 
     if (!is_display_connected(ctx, disp))
-	return 0;
+	   return 0;
 
     for (int i = content->numHwLayers - 1;  i >= 0; i--) {
-        hwc_layer_1_t &layer = content->hwLayers[i];
-	private_handle_t *hnd = (private_handle_t *)layer.handle;
-	int plane_id;
+       hwc_layer_1_t &layer = content->hwLayers[i];
+	   private_handle_t *hnd = (private_handle_t *)layer.handle;
+	   int plane_id;
 
-        if (layer.compositionType == HWC_FRAMEBUFFER_TARGET)
-            continue;
+	   if (layer.flags & HWC_SKIP_LAYER)
+		   continue;
 
-	if (target_framebuffer) {
-	   layer.compositionType = HWC_FRAMEBUFFER;
-	   continue;
-	}
+       if (layer.compositionType == HWC_FRAMEBUFFER_TARGET)
+          continue;
 
-	plane_id = find_plane(ctx, disp, hnd);
-	if (plane_id) {
-	   layer.compositionType = HWC_OVERLAY;
-	   continue;
-	}
+	   if (target_framebuffer) {
+	      layer.compositionType = HWC_FRAMEBUFFER;
+	      continue;
+	   }
 
-        layer.compositionType = HWC_FRAMEBUFFER;
-	target_framebuffer = true;
+	   plane_id = find_plane(ctx, disp, hnd);
+	   if (plane_id) {
+	      layer.compositionType = HWC_OVERLAY;
+	      continue;
+	   }
+
+       layer.compositionType = HWC_FRAMEBUFFER;
+	   target_framebuffer = true;
     }
 
     return 0;
@@ -448,14 +467,17 @@ static int hwc_prepare (struct hwc_composer_device_1 *dev,
     ctx->used_planes = 0;
 
     if (content) {
-	ret = prepare_display (ctx, HWC_DISPLAY_PRIMARY, content);
+	  ret = prepare_display (ctx, HWC_DISPLAY_PRIMARY, content);
+
 	if (ret)
 		return ret;
     }
 
+	/* do not use planes for external display */
+	ctx->used_planes = -1;
     content = displays[HWC_DISPLAY_EXTERNAL];
     if (content)
-	ret = prepare_display (ctx, HWC_DISPLAY_EXTERNAL, content);
+	  ret = prepare_display (ctx, HWC_DISPLAY_EXTERNAL, content);
 
     return ret;
 }
