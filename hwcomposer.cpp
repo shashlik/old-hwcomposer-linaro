@@ -7,9 +7,9 @@ struct hwc_fourcc {
 };
 
 static const struct hwc_fourcc to_fourcc[] = {
-    {HAL_PIXEL_FORMAT_RGBA_8888, DRM_FORMAT_ARGB8888},
-    {HAL_PIXEL_FORMAT_RGBX_8888, DRM_FORMAT_XRGB8888},
-    {HAL_PIXEL_FORMAT_BGRA_8888, DRM_FORMAT_BGRA8888},
+    {HAL_PIXEL_FORMAT_RGBA_8888, DRM_FORMAT_ABRG8888},
+    {HAL_PIXEL_FORMAT_RGBX_8888, DRM_FORMAT_XBGR8888},
+    {HAL_PIXEL_FORMAT_BGRA_8888, DRM_FORMAT_ARGB8888},
     {HAL_PIXEL_FORMAT_RGB_888,   DRM_FORMAT_RGB888},
     {HAL_PIXEL_FORMAT_RGB_565,   DRM_FORMAT_RGB565},
     {HAL_PIXEL_FORMAT_YV12,      DRM_FORMAT_NV12},
@@ -289,12 +289,7 @@ static int update_display(hwc_context_t *ctx, int disp,
 		}
 		pitch[0] = width * 4; //stride
 
-		/* force format for framebuffer because GPU claim use RGBA */
-		if (display->hwLayers[i].compositionType == HWC_FRAMEBUFFER_TARGET)
-			fourcc = DRM_FORMAT_ARGB8888;
-
-		ret = drmModeAddFB2(ctx->drm_fd, width, height, fourcc,
-            bo, pitch, offset, &fb, 0);
+		ret = drmModeAddFB2(ctx->drm_fd, width, height, fourcc, bo, pitch, offset, &fb, 0);
 		if (ret) {
 			ALOGE("cannot create framebuffer (%d): %m\n",errno);
 			return ret;
