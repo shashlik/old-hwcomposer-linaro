@@ -8,7 +8,7 @@ struct hwc_fourcc
 };
 
 static const struct hwc_fourcc to_fourcc[] = {
-    {HAL_PIXEL_FORMAT_RGBA_8888, DRM_FORMAT_ABRG8888},
+    {HAL_PIXEL_FORMAT_RGBA_8888, DRM_FORMAT_ABGR8888},
     {HAL_PIXEL_FORMAT_RGBX_8888, DRM_FORMAT_XBGR8888},
     {HAL_PIXEL_FORMAT_BGRA_8888, DRM_FORMAT_ARGB8888},
     {HAL_PIXEL_FORMAT_RGB_888, DRM_FORMAT_RGB888},
@@ -33,12 +33,12 @@ send_vsync_request (hwc_context_t * ctx, int disp)
 
     drmVBlank vbl;
 
-    vbl.request.type =
-        (drmVBlankSeqType) (DRM_VBLANK_RELATIVE | DRM_VBLANK_EVENT);
-    if (disp)                   //TODO: Use high crtc flag
+    if (disp == HWC_DISPLAY_PRIMARY)
+	vbl.request.type =
+	    (drmVBlankSeqType) (DRM_VBLANK_RELATIVE | DRM_VBLANK_EVENT);
+    else
         vbl.request.type =
-            (drmVBlankSeqType) (DRM_VBLANK_RELATIVE | DRM_VBLANK_EVENT |
-            DRM_VBLANK_SECONDARY);
+            (drmVBlankSeqType) (DRM_VBLANK_RELATIVE | DRM_VBLANK_EVENT | DRM_VBLANK_SECONDARY);
 
     vbl.request.sequence = 1;
     vbl.request.signal = (unsigned long) &ctx->displays[disp];
@@ -59,7 +59,10 @@ vblank_handler (int fd, unsigned int frame, unsigned int sec,
 
     if (kdisp->vsync_on) {
         int64_t ts = sec * (int64_t) 1000000000 + usec * (int64_t) 1000;
-        procs->vsync (procs, 0, ts);
+        int disp = &kdisp->ctx->displays[HWC_DISPLAY_PRIMARY] == kdisp ? HWC_DISPLAY_PRIMARY : HWC_DISPLAY_EXTERNAL;
+
+        procs->vsync (procs, disp, ts);
+        send_vsync_request (kdisp->ctx, disp);
     }
 }
 
@@ -180,9 +183,16 @@ event_handler (void *arg)
         .vblank_handler = vblank_handler,
         .page_flip_handler = NULL,
     };
-    struct pollfd pfds[1] = { {.fd = drm_fd,.events = POLLIN,.revents =
-                POLLERR}
-    };
+    struct pollfd pfds[1] = {{
+	.fd = drm_fd,
+	.events = POLLIN,
+	.revents = POLLERR
+    }};
+
+    // From documentation for hwc_procs, the vsync event must be handled
+    // on a thread with priority HAL_PRIORITY_URGENT_DISPLAY or higher.
+    // This is further explained in graphics.h.
+    setpriority(PRIO_PROCESS, 0, HAL_PRIORITY_URGENT_DISPLAY);
 
     while (1) {
         int ret = poll (pfds, ARRAY_SIZE (pfds), 60000);
@@ -347,26 +357,6 @@ update_display (hwc_context_t * ctx, int disp,
 
         }
     }
-
-    /* Clean up */
-    if (kdisp->last_fb) {
-        drmModeFBPtr lastFBPtr;
-        uint32_t handle;
-        struct drm_gem_close close_args;
-
-        lastFBPtr = drmModeGetFB (ctx->drm_fd, kdisp->last_fb);
-        handle = lastFBPtr->handle;
-        drmModeRmFB (ctx->drm_fd, kdisp->last_fb);
-
-        close_args.handle = handle;
-        ret = drmIoctl (ctx->drm_fd, DRM_IOCTL_GEM_CLOSE, &close_args);
-        if (ret) {
-            ALOGE ("Failed to release buffer (Handle = 0x%x): %d\n", handle,
-                ret);
-            return ret;
-        }
-    }
-    kdisp->last_fb = fb;
 
     return 0;
 }
@@ -539,8 +529,8 @@ hwc_query (struct hwc_composer_device_1 *dev, int what, int *value)
 
     switch (what) {
         case HWC_BACKGROUND_LAYER_SUPPORTED:
-            value[0] = 1;       //support the background layer
-            break;
+            value[0] = 0;
+	    break;
         case HWC_VSYNC_PERIOD:
             value[0] = 1000000000 / refreshRate;
             break;
@@ -629,7 +619,16 @@ hwc_getDisplayAttributes (struct hwc_composer_device_1 *dev, int disp,
 static int
 hwc_blank (struct hwc_composer_device_1 *dev, int disp, int blank)
 {
-    return 0;
+    hwc_context_t *ctx = to_ctx (dev);
+    int arg, ret;
+
+    if (!is_display_connected (ctx, disp))
+        return -EINVAL;
+
+    arg = blank ? FB_BLANK_POWERDOWN : FB_BLANK_UNBLANK;
+
+    ret = ioctl (ctx->drm_fd, FBIOBLANK, arg);
+    return ret;
 }
 
 static void

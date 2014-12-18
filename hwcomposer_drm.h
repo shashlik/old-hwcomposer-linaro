@@ -42,7 +42,6 @@ typedef struct kms_display {
     int crtc_id;
     drmModeModeInfoPtr mode;
     drmEventContext evctx;
-    uint32_t last_fb;
     int vsync_on;
     struct hwc_context *ctx;
 } kms_display_t;
