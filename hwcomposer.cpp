@@ -23,6 +23,7 @@ hnd_to_fourcc (private_handle_t const *hnd)
         if (to_fourcc[i].hwc_format == hnd->format)
             return to_fourcc[i].fourcc;
 
+    ALOGI("hnd_to_fourcc can't find matching format for %ul\n", hnd->format);
     return 0;
 }
 
@@ -262,6 +263,29 @@ free_properties:
     return ! !ret;
 }
 
+static void release_fences (hwc_display_contents_1_t * display)
+{
+    if (display->retireFenceFd >= 0)
+	display->retireFenceFd = -1;
+
+    for (size_t i = 0; i < display->numHwLayers; i++) {
+        hwc_layer_1_t *target = &display->hwLayers[i];
+
+	if (target->acquireFenceFd >= 0) {
+            int ret = sync_wait (target->acquireFenceFd, 1000);
+            if (ret < 0) {
+                ALOGE ("%s: sync_wait error!! error no = %d err str = %s",
+                    __FUNCTION__, errno, strerror (errno));
+            }
+            close (target->acquireFenceFd);
+            target->acquireFenceFd = -1;
+        }
+
+	if (target->releaseFenceFd >= 0)
+	    target->releaseFenceFd = -1;
+    }
+}
+
 static int
 update_display (hwc_context_t * ctx, int disp,
     hwc_display_contents_1_t * display)
@@ -306,16 +330,6 @@ update_display (hwc_context_t * ctx, int disp,
             return -EINVAL;
         }
 
-        if (target->acquireFenceFd != -1) {
-            ret = sync_wait (target->acquireFenceFd, 1000);
-            if (ret < 0) {
-                ALOGE ("%s: sync_wait error!! error no = %d err str = %s",
-                    __FUNCTION__, errno, strerror (errno));
-            }
-            close (target->acquireFenceFd);
-            target->acquireFenceFd = -1;
-        }
-
         width = hnd->width;
         height = hnd->height;
 
@@ -324,13 +338,21 @@ update_display (hwc_context_t * ctx, int disp,
             ALOGE ("Failed to get fd for DUMB buffer %s", strerror (errno));
             return ret;
         }
-        pitch[0] = width * 4;   //stride
+
+	if (fourcc == DRM_FORMAT_NV12) {
+	    bo[1] = bo[0];
+	    pitch[0] = width;
+	    pitch[1] = width;
+	    offset[1] = width * height;
+	} else {
+	    pitch[0] = width * 4;   //stride
+	}
 
         ret =
             drmModeAddFB2 (ctx->drm_fd, width, height, fourcc, bo, pitch,
             offset, &fb, 0);
         if (ret) {
-            ALOGE ("cannot create framebuffer (%d): %m\n", errno);
+            ALOGE ("cannot create framebuffer (%d): %s\n", errno, strerror (errno));
             return ret;
         }
 
@@ -350,14 +372,15 @@ update_display (hwc_context_t * ctx, int disp,
                 target->displayFrame.top,
                 target->displayFrame.right - target->displayFrame.left,
                 target->displayFrame.bottom - target->displayFrame.top,
-                target->sourceCrop.left,
-                target->sourceCrop.top,
+                target->sourceCrop.left << 16,
+                target->sourceCrop.top << 16,
                 (target->sourceCrop.right - target->sourceCrop.left) << 16,
                 (target->sourceCrop.bottom - target->sourceCrop.top) << 16);
 
         }
     }
 
+    release_fences (display);
     return 0;
 }
 
@@ -394,8 +417,10 @@ find_plane (hwc_context_t * ctx, int disp, private_handle_t * hnd)
     int drm_fd = ctx->drm_fd;
     unsigned int fourcc = hnd_to_fourcc (hnd);
 
-    if (!fourcc)
+    if (!fourcc) {
+	 ALOGI("no plane fourcc for handle %08x\n", intptr_t(hnd));
         return ret;
+    }
 
     plane_res = drmModeGetPlaneResources (drm_fd);
 
@@ -418,7 +443,7 @@ find_plane (hwc_context_t * ctx, int disp, private_handle_t * hnd)
         }
 
         for (j = 0; j < plane->count_formats && !ret; j++) {
-            if (plane->formats[j] == fourcc) {
+	     if (plane->formats[j] == fourcc) {
                 ret = plane->plane_id;
                 hnd->plane_id = plane->plane_id;
                 ctx->used_planes |= 1 << i;
