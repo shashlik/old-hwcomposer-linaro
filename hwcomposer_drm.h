@@ -35,6 +35,8 @@
 #define ARRAY_SIZE(arr) (sizeof(arr)/sizeof((arr)[0]))
 #endif
 
+#define FENCE_DELAY 2
+
 typedef struct kms_display {
     drmModeConnectorPtr con;
     drmModeEncoderPtr enc;
@@ -44,6 +46,10 @@ typedef struct kms_display {
     drmEventContext evctx;
     int vsync_on;
     struct hwc_context *ctx;
+
+    /* sync */
+    int timeline;
+    unsigned signaled_fences;
 } kms_display_t;
 
 typedef struct hwc_context {
@@ -58,7 +64,6 @@ typedef struct hwc_context {
 
     pthread_t event_thread;
 
-    /* CHECK : bibhuti*/
     int32_t xres;
     int32_t yres;
     int32_t xdpi;
@@ -67,7 +72,6 @@ typedef struct hwc_context {
 
     /* drm planes management*/
     uint64_t used_planes;
-
 } hwc_context_t;
 
 #endif //#ifndef ANDROID_HWC_H_

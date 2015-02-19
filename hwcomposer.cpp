@@ -1,3 +1,5 @@
+#include <sync/sw_sync.h>
+
 #include <hwcomposer_drm.h>
 #include "gralloc_priv.h"
 
@@ -51,20 +53,33 @@ send_vsync_request (hwc_context_t * ctx, int disp)
     return ret;
 }
 
+static void signal_fences (hwc_context_t * ctx, int disp)
+{
+     kms_display_t *kdisp = &ctx->displays[disp];
+
+     /* signal timeline point */
+     sw_sync_timeline_inc(kdisp->timeline, 1);
+     kdisp->signaled_fences++;
+}
+
 static void
 vblank_handler (int fd, unsigned int frame, unsigned int sec,
     unsigned int usec, void *data)
 {
     kms_display_t *kdisp = (kms_display_t *) data;
     const hwc_procs_t *procs = kdisp->ctx->cb_procs;
+    int disp = &kdisp->ctx->displays[HWC_DISPLAY_PRIMARY] == kdisp ? HWC_DISPLAY_PRIMARY : HWC_DISPLAY_EXTERNAL;
+
+    signal_fences (kdisp->ctx, disp);
 
     if (kdisp->vsync_on) {
         int64_t ts = sec * (int64_t) 1000000000 + usec * (int64_t) 1000;
-        int disp = &kdisp->ctx->displays[HWC_DISPLAY_PRIMARY] == kdisp ? HWC_DISPLAY_PRIMARY : HWC_DISPLAY_EXTERNAL;
 
         procs->vsync (procs, disp, ts);
-        send_vsync_request (kdisp->ctx, disp);
     }
+
+    /* request next VSYNC */
+    send_vsync_request (kdisp->ctx, disp);
 }
 
 static int
@@ -136,6 +151,11 @@ init_display (hwc_context_t * ctx, int disp)
 
     drmModeFreeResources (resources);
 
+    /* sync init */
+    d->timeline = sw_sync_timeline_create();
+    d->signaled_fences = 0;
+    d->vsync_on = 0;
+
     return 0;
 
 free_encoder:
@@ -158,6 +178,8 @@ destroy_display (int drm_fd, kms_display_t * d)
     if (d->con)
         drmModeFreeConnector (d->con);
     memset (d, 0, sizeof (*d));
+
+    close(d->timeline);
 }
 
 static void
@@ -194,6 +216,10 @@ event_handler (void *arg)
     // on a thread with priority HAL_PRIORITY_URGENT_DISPLAY or higher.
     // This is further explained in graphics.h.
     setpriority(PRIO_PROCESS, 0, HAL_PRIORITY_URGENT_DISPLAY);
+
+    /* request a first VSYNC */
+    send_vsync_request (ctx, HWC_DISPLAY_PRIMARY);
+    send_vsync_request (ctx, HWC_DISPLAY_EXTERNAL);
 
     while (1) {
         int ret = poll (pfds, ARRAY_SIZE (pfds), 60000);
@@ -263,27 +289,21 @@ free_properties:
     return ! !ret;
 }
 
-static void release_fences (hwc_display_contents_1_t * display)
+static void set_release_fences (hwc_context_t * ctx, int disp,
+    hwc_display_contents_1_t * display)
 {
-    if (display->retireFenceFd >= 0)
-	display->retireFenceFd = -1;
+    kms_display_t *kdisp = &ctx->displays[disp];
+    int fence;
+
+    fence = sw_sync_fence_create(kdisp->timeline, "Fence", kdisp->signaled_fences + FENCE_DELAY);
 
     for (size_t i = 0; i < display->numHwLayers; i++) {
         hwc_layer_1_t *target = &display->hwLayers[i];
-
-	if (target->acquireFenceFd >= 0) {
-            int ret = sync_wait (target->acquireFenceFd, 1000);
-            if (ret < 0) {
-                ALOGE ("%s: sync_wait error!! error no = %d err str = %s",
-                    __FUNCTION__, errno, strerror (errno));
-            }
-            close (target->acquireFenceFd);
-            target->acquireFenceFd = -1;
-        }
-
-	if (target->releaseFenceFd >= 0)
-	    target->releaseFenceFd = -1;
+	if (target->compositionType == HWC_OVERLAY)
+	    target->releaseFenceFd = dup(fence);
     }
+
+    display->retireFenceFd = fence;
 }
 
 static int
@@ -318,6 +338,17 @@ update_display (hwc_context_t * ctx, int disp,
         if ((display->hwLayers[i].compositionType != HWC_FRAMEBUFFER_TARGET)
             && (display->hwLayers[i].compositionType != HWC_OVERLAY))
             continue;
+
+	/* wait for sync */
+	if (target->acquireFenceFd >= 0) {
+            int ret = sync_wait (target->acquireFenceFd, 1000);
+            if (ret < 0) {
+                ALOGE ("%s: sync_wait error!! error no = %d err str = %s",
+                    __FUNCTION__, errno, strerror (errno));
+            }
+            close (target->acquireFenceFd);
+            target->acquireFenceFd = -1;
+        }
 
         unsigned int fourcc = hnd_to_fourcc (hnd);
 
@@ -380,7 +411,7 @@ update_display (hwc_context_t * ctx, int disp,
         }
     }
 
-    release_fences (display);
+    set_release_fences (ctx, disp, display);
     return 0;
 }
 
@@ -538,8 +569,6 @@ hwc_eventControl (struct hwc_composer_device_1 *dev, int disp,
     switch (event) {
         case HWC_EVENT_VSYNC:
             ctx->displays[disp].vsync_on = enabled;
-            if (enabled)
-                send_vsync_request (ctx, disp);
             return 0;
         default:
             return -EINVAL;
