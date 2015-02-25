@@ -1,5 +1,3 @@
-#include <sync/sw_sync.h>
-
 #include <hwcomposer_drm.h>
 #include "gralloc_priv.h"
 

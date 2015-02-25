@@ -27,9 +27,10 @@ LOCAL_MODULE := hwcomposer.default
 LOCAL_CFLAGS:= -DLOG_TAG=\"hwcomposer\"
 LOCAL_MODULE_TAGS := eng
 LOCAL_C_INCLUDES += \
-        $(LOCAL_PATH)/../gralloc \
-        $(LOCAL_PATH)/../../../../external/drm \
-        $(LOCAL_PATH)/../../../../external/drm/include/drm \
-        $(LOCAL_PATH)/../../include
+        $(TOP)/hardware/libhardware/modules/gralloc \
+        $(TOP)/external/drm \
+        $(TOP)/external/drm/include/drm \
+        $(TOP)/hardware/libhardware/include \
+        $(TOP)/system/core/libsync
 
 include $(BUILD_SHARED_LIBRARY)
