@@ -1,6 +1,27 @@
 #include <hwcomposer_drm.h>
 #include "gralloc_priv.h"
 
+/*
+ * The primary and external displays are controlled by the ro.disp.conn.primary
+ * and ro.disp.conn.external properties.
+ * This properties define the connector of the displays, their values are strings
+ * as defined by the DRM interface (DRM_MODE_CONECTOR_xyz).
+ *
+ * Configuration example (HDMI for main, LVDS for external):
+ *  setprop ro.disp.conn.primary HDMIA
+ *  setprop ro.disp.conn.external LVDS
+ *
+ * If a property is set to "Unknown", then the first (resp. second) connector
+ * as listed by the display driver is used for the primary (resp. external)
+ * display.
+ *
+ * If ro.disp.conn.primary is not defined, then it is assumed to be set to
+ * "Unknown".
+ *
+ * If ro.disp.conn.external is set to "OFF" or is not defined, then the external
+ * display is not enabled
+ */
+
 struct hwc_fourcc
 {
     int hwc_format;
@@ -26,6 +47,32 @@ hnd_to_fourcc (private_handle_t const *hnd)
     ALOGI("hnd_to_fourcc can't find matching format for %ul\n", hnd->format);
     return 0;
 }
+
+#define CONN_STR_AND_INT(type) { DRM_MODE_CONNECTOR_ ## type, #type }
+
+struct hwc_connector
+{
+    int type;
+    char name[64];
+};
+
+static const struct hwc_connector connector_list[] = {
+    CONN_STR_AND_INT(Unknown),
+    CONN_STR_AND_INT(VGA),
+    CONN_STR_AND_INT(DVII),
+    CONN_STR_AND_INT(DVID),
+    CONN_STR_AND_INT(DVIA),
+    CONN_STR_AND_INT(Composite),
+    CONN_STR_AND_INT(SVIDEO),
+    CONN_STR_AND_INT(LVDS),
+    CONN_STR_AND_INT(Component),
+    CONN_STR_AND_INT(9PinDIN),
+    CONN_STR_AND_INT(DisplayPort),
+    CONN_STR_AND_INT(HDMIA),
+    CONN_STR_AND_INT(HDMIB),
+    CONN_STR_AND_INT(TV),
+    CONN_STR_AND_INT(eDP)
+};
 
 static int
 send_vsync_request (hwc_context_t * ctx, int disp)
@@ -81,16 +128,16 @@ vblank_handler (int fd, unsigned int frame, unsigned int sec,
 }
 
 static int
-init_display (hwc_context_t * ctx, int disp)
+init_display (hwc_context_t * ctx, int disp, uint32_t connector_type)
 {
     kms_display_t *d = &ctx->displays[disp];
     const char *modules[] = {
 	"i915", "radeon", "nouveau", "vmwgfx", "omapdrm", "exynos",
         "tilcdc", "msm", "sti"
     };
-    int drm_fd;
+    int drm_fd, i;
     drmModeResPtr resources;
-    drmModeConnector *connector;
+    drmModeConnector *connector = NULL;
     drmModeEncoder *encoder;
     drmModeModeInfoPtr mode;
     uint32_t possible_crtcs;
@@ -122,13 +169,27 @@ init_display (hwc_context_t * ctx, int disp)
         goto close;
     }
 
-    connector = drmModeGetConnector (drm_fd, resources->connectors[disp]);
+    if (connector_type == DRM_MODE_CONNECTOR_Unknown) {
+        if (disp < resources->count_connectors)
+            connector = drmModeGetConnector (drm_fd, resources->connectors[disp]);
+    } else {
+        for (i = 0; i < resources->count_connectors; i++) {
+            connector = drmModeGetConnector (drm_fd, resources->connectors[i]);
+            if (connector->connector_type == connector_type)
+                break;
+            drmModeFreeConnector (connector);
+            connector = NULL;
+        }
+    }
+
     if (!connector) {
-        ALOGE ("No connector for DISPLAY %d\n", disp);
+        ALOGE ("No connector %d (display %d)\n", connector_type, disp);
         goto free_ressources;
     }
 
     mode = &connector->modes[0];
+    ALOGI ("Display %d: %dx%d, type=%s\n", disp, mode->hdisplay, mode->vdisplay,
+            connector_list[connector->connector_type].name);
 
     encoder = drmModeGetEncoder (drm_fd, connector->encoders[0]);
     if (!encoder) {
@@ -718,6 +779,33 @@ init_gralloc (int drm_fd)
 }
 
 static int
+hwc_get_connector (char *conn_str)
+{
+    uint32_t i;
+
+    /* Property not set or empty */
+    if (conn_str[0] == '\0')
+        return DRM_MODE_CONNECTOR_Unknown;
+
+    /* Disabled display */
+    if (!strncasecmp(conn_str, "OFF", 64))
+        return -1;
+
+    /* Look for known connectors */
+    for (i = 0; i < ARRAY_SIZE(connector_list); i++) {
+        if (!strncasecmp(conn_str, connector_list[i].name, 64))
+            return connector_list[i].type;
+    }
+
+    /* Add this useful case */
+    if (!strncasecmp(conn_str, "HDMI", 64))
+        return DRM_MODE_CONNECTOR_HDMIA;
+
+    ALOGE ("Unknown connector (%s), will use default\n", conn_str);
+    return DRM_MODE_CONNECTOR_Unknown;
+}
+
+static int
 hwc_device_open (const struct hw_module_t *module, const char *name,
     struct hw_device_t **device)
 {
@@ -727,6 +815,8 @@ hwc_device_open (const struct hw_module_t *module, const char *name,
     int err = 0;
     int ret = 0;
     int drm_fd = 0;
+    int connector;
+    char prop_val[PROPERTY_VALUE_MAX];
 
     if (strcmp (name, HWC_HARDWARE_COMPOSER))
         return -EINVAL;
@@ -758,14 +848,19 @@ hwc_device_open (const struct hw_module_t *module, const char *name,
         return ret;
     }
 
-    ret = init_display (ctx, HWC_DISPLAY_PRIMARY);
+    property_get("ro.disp.conn.primary", prop_val, "");
+    connector = hwc_get_connector (prop_val);
+    ret = init_display (ctx, HWC_DISPLAY_PRIMARY, connector);
     if (ret) {
         if (ctx->drm_fd != -1)
             drmClose (ctx->drm_fd);
         return -EINVAL;
     }
 
-    init_display (ctx, HWC_DISPLAY_EXTERNAL);
+    property_get("ro.disp.conn.external", prop_val, "OFF");
+    connector = hwc_get_connector (prop_val);
+    if (connector >= 0)
+        init_display (ctx, HWC_DISPLAY_EXTERNAL, connector);
 
     ctx->used_planes = 0;
 
