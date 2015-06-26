@@ -24,7 +24,6 @@
 #include <sync/sync.h>
 #include "sw_sync.h"
 
-#include "gralloc_priv.h"
 #include "drm_fourcc.h"
 #include "xf86drm.h"
 #include "xf86drmMode.h"

@@ -1,5 +1,9 @@
 #include <hwcomposer_drm.h>
-#include "gralloc_priv.h"
+#include "gralloc_drm_handle.h"
+#include "gralloc_drm.h"
+
+#include <utils/Log.h>
+
 
 /*
  * The primary and external displays are controlled by the ro.disp.conn.primary
@@ -28,25 +32,25 @@ struct hwc_fourcc
     unsigned int fourcc;
 };
 
-static const struct hwc_fourcc to_fourcc[] = {
-    {HAL_PIXEL_FORMAT_RGBA_8888, DRM_FORMAT_ABGR8888},
-    {HAL_PIXEL_FORMAT_RGBX_8888, DRM_FORMAT_XBGR8888},
-    {HAL_PIXEL_FORMAT_BGRA_8888, DRM_FORMAT_ARGB8888},
-    {HAL_PIXEL_FORMAT_RGB_888, DRM_FORMAT_RGB888},
-    {HAL_PIXEL_FORMAT_RGB_565, DRM_FORMAT_RGB565},
-    {HAL_PIXEL_FORMAT_YV12, DRM_FORMAT_NV12},
-};
-
-static unsigned int
-hnd_to_fourcc (private_handle_t const *hnd)
-{
-    for (unsigned int i = 0; i < ARRAY_SIZE (to_fourcc); i++)
-        if (to_fourcc[i].hwc_format == hnd->format)
-            return to_fourcc[i].fourcc;
-
-    ALOGI("hnd_to_fourcc can't find matching format for %ul\n", hnd->format);
-    return 0;
-}
+// static const struct hwc_fourcc to_fourcc[] = {
+//     {HAL_PIXEL_FORMAT_RGBA_8888, DRM_FORMAT_ABGR8888},
+//     {HAL_PIXEL_FORMAT_RGBX_8888, DRM_FORMAT_XBGR8888},
+//     {HAL_PIXEL_FORMAT_BGRA_8888, DRM_FORMAT_ARGB8888},
+//     {HAL_PIXEL_FORMAT_RGB_888, DRM_FORMAT_RGB888},
+//     {HAL_PIXEL_FORMAT_RGB_565, DRM_FORMAT_RGB565},
+//     {HAL_PIXEL_FORMAT_YV12, DRM_FORMAT_NV12},
+// };
+//
+// static unsigned int
+// hnd_to_fourcc (private_handle_t const *hnd)
+// {
+//     for (unsigned int i = 0; i < ARRAY_SIZE (to_fourcc); i++)
+//         if (to_fourcc[i].hwc_format == hnd->format)
+//             return to_fourcc[i].fourcc;
+//
+//     ALOGI("hnd_to_fourcc can't find matching format for %ul\n", hnd->format);
+//     return 0;
+// }
 
 #define CONN_STR_AND_INT(type) { DRM_MODE_CONNECTOR_ ## type, #type }
 
@@ -141,12 +145,14 @@ init_display (hwc_context_t * ctx, int disp, uint32_t connector_type)
     drmModeEncoder *encoder;
     drmModeModeInfoPtr mode;
     uint32_t possible_crtcs;
-    private_module_t *m = NULL;
+//     gralloc_module_t *m = NULL;
 
     /* open drm only once for all the displays */
     if (ctx->drm_fd < 0) {
         /* Open DRM device */
         for (unsigned int i = 0; i < ARRAY_SIZE (modules); i++) {
+
+            ALOGE("DAVE, opening %d", drm_fd);
             drm_fd = drmOpen (modules[i], NULL);
             if (drm_fd >= 0) {
                 ALOGI ("Open %s drm device (%d)\n", modules[i], drm_fd);
@@ -377,6 +383,8 @@ update_display (hwc_context_t * ctx, int disp,
     uint32_t offset[4] = { 0 };
     hwc_layer_1_t *target = NULL;
 
+    ALOGE("Drawing to display");
+
     kms_display_t *kdisp = &ctx->displays[disp];
 
     if (!is_display_connected (ctx, disp))
@@ -388,11 +396,8 @@ update_display (hwc_context_t * ctx, int disp,
         if (!target)
             continue;
 
-        private_handle_t const *hnd =
-            reinterpret_cast < private_handle_t const *>(target->handle);
-
-        if (!hnd)
-            continue;
+        gralloc_drm_handle_t const *hnd =
+            reinterpret_cast < gralloc_drm_handle_t const *>(target->handle);
 
         if ((display->hwLayers[i].compositionType != HWC_FRAMEBUFFER_TARGET)
             && (display->hwLayers[i].compositionType != HWC_OVERLAY))
@@ -409,65 +414,9 @@ update_display (hwc_context_t * ctx, int disp,
             target->acquireFenceFd = -1;
         }
 
-        unsigned int fourcc = hnd_to_fourcc (hnd);
 
-        if (!fourcc)
-            return -EINVAL;
-
-        if (!(hnd->flags & private_handle_t::PRIV_FLAGS_USES_ION)) {
-            AERR ("private_handle_t isn't using ION, hnd->flags %d",
-                hnd->flags);
-            return -EINVAL;
-        }
-
-        width = hnd->width;
-        height = hnd->height;
-
-        ret = drmPrimeFDToHandle (ctx->drm_fd, hnd->share_fd, &bo[0]);
-        if (ret) {
-            ALOGE ("Failed to get fd for DUMB buffer %s", strerror (errno));
-            return ret;
-        }
-
-	if (fourcc == DRM_FORMAT_NV12) {
-	    bo[1] = bo[0];
-	    pitch[0] = width;
-	    pitch[1] = width;
-	    offset[1] = width * height;
-	} else {
-	    pitch[0] = width * 4;   //stride
-	}
-
-        ret =
-            drmModeAddFB2 (ctx->drm_fd, width, height, fourcc, bo, pitch,
-            offset, &fb, 0);
-        if (ret) {
-            ALOGE ("cannot create framebuffer (%d): %s\n", errno, strerror (errno));
-            return ret;
-        }
-
-        if (display->hwLayers[i].compositionType == HWC_FRAMEBUFFER_TARGET) {
-            drmModeSetCrtc (ctx->drm_fd, kdisp->crtc_id, fb, 0, 0,
-                &kdisp->con->connector_id, 1, kdisp->mode);
-            zorder++;
-        }
-
-        if (display->hwLayers[i].compositionType == HWC_OVERLAY) {
-            int plane_id = hnd->plane_id;
-
-            set_zorder (ctx, plane_id, zorder++);
-
-            drmModeSetPlane (ctx->drm_fd, plane_id, kdisp->crtc_id, fb, 0,
-                target->displayFrame.left,
-                target->displayFrame.top,
-                target->displayFrame.right - target->displayFrame.left,
-                target->displayFrame.bottom - target->displayFrame.top,
-                target->sourceCrop.left << 16,
-                target->sourceCrop.top << 16,
-                (target->sourceCrop.right - target->sourceCrop.left) << 16,
-                (target->sourceCrop.bottom - target->sourceCrop.top) << 16);
-
-        }
+        ret = gralloc_drm_bo_post(hnd->data);
+        return ret;
     }
 
     set_release_fences (ctx, disp, display);
@@ -499,54 +448,54 @@ hwc_set (struct hwc_composer_device_1 *dev,
     return ret;
 }
 
-static int
-find_plane (hwc_context_t * ctx, int disp, private_handle_t * hnd)
-{
-    unsigned int i, j, ret = 0;
-    drmModePlaneResPtr plane_res;
-    int drm_fd = ctx->drm_fd;
-    unsigned int fourcc = hnd_to_fourcc (hnd);
-
-    if (!fourcc) {
-	 ALOGI("no plane fourcc for handle %08x\n", intptr_t(hnd));
-        return ret;
-    }
-
-    plane_res = drmModeGetPlaneResources (drm_fd);
-
-    for (i = 0; i < plane_res->count_planes && !ret; i++) {
-        drmModePlanePtr plane;
-
-        plane = drmModeGetPlane (drm_fd, plane_res->planes[i]);
-
-        if (!plane)
-            continue;
-
-        if (!(plane->possible_crtcs & (1 << disp))) {
-            drmModeFreePlane (plane);
-            continue;
-        }
-
-        if (ctx->used_planes & (1 << i)) {
-            drmModeFreePlane (plane);
-            continue;
-        }
-
-        for (j = 0; j < plane->count_formats && !ret; j++) {
-	     if (plane->formats[j] == fourcc) {
-                ret = plane->plane_id;
-                hnd->plane_id = plane->plane_id;
-                ctx->used_planes |= 1 << i;
-            }
-        }
-
-        drmModeFreePlane (plane);
-    }
-
-    drmModeFreePlaneResources (plane_res);
-
-    return ret;
-}
+// static int
+// find_plane (hwc_context_t * ctx, int disp, private_handle_t * hnd)
+// {
+//     unsigned int i, j, ret = 0;
+//     drmModePlaneResPtr plane_res;
+//     int drm_fd = ctx->drm_fd;
+//     unsigned int fourcc = hnd_to_fourcc (hnd);
+//
+//     if (!fourcc) {
+// 	 ALOGI("no plane fourcc for handle %08x\n", intptr_t(hnd));
+//         return ret;
+//     }
+//
+//     plane_res = drmModeGetPlaneResources (drm_fd);
+//
+//     for (i = 0; i < plane_res->count_planes && !ret; i++) {
+//         drmModePlanePtr plane;
+//
+//         plane = drmModeGetPlane (drm_fd, plane_res->planes[i]);
+//
+//         if (!plane)
+//             continue;
+//
+//         if (!(plane->possible_crtcs & (1 << disp))) {
+//             drmModeFreePlane (plane);
+//             continue;
+//         }
+//
+//         if (ctx->used_planes & (1 << i)) {
+//             drmModeFreePlane (plane);
+//             continue;
+//         }
+//
+//         for (j = 0; j < plane->count_formats && !ret; j++) {
+// 	     if (plane->formats[j] == fourcc) {
+//                 ret = plane->plane_id;
+//                 hnd->plane_id = plane->plane_id;
+//                 ctx->used_planes |= 1 << i;
+//             }
+//         }
+//
+//         drmModeFreePlane (plane);
+//     }
+//
+//     drmModeFreePlaneResources (plane_res);
+//
+//     return ret;
+// }
 
 static int
 prepare_display (hwc_context_t * ctx, int disp,
@@ -560,8 +509,8 @@ prepare_display (hwc_context_t * ctx, int disp,
 
     for (int i = content->numHwLayers - 1; i >= 0; i--) {
         hwc_layer_1_t & layer = content->hwLayers[i];
-        private_handle_t *hnd = (private_handle_t *) layer.handle;
-        int plane_id;
+//         private_handle_t *hnd = (private_handle_t *) layer.handle;
+//         int plane_id;
 
         if (layer.flags & HWC_SKIP_LAYER)
             continue;
@@ -574,11 +523,11 @@ prepare_display (hwc_context_t * ctx, int disp,
             continue;
         }
 
-        plane_id = find_plane (ctx, disp, hnd);
-        if (plane_id) {
-            layer.compositionType = HWC_OVERLAY;
-            continue;
-        }
+//         plane_id = find_plane (ctx, disp, hnd);
+//         if (plane_id) {
+//             layer.compositionType = HWC_OVERLAY;
+//             continue;
+//         }
 
         layer.compositionType = HWC_FRAMEBUFFER;
         target_framebuffer = true;
@@ -680,7 +629,10 @@ hwc_getDisplayConfigs (struct hwc_composer_device_1 *dev,
     if (is_display_connected (ctx, disp)) {
         configs[0] = HWC_DEFAULT_CONFIG;
         *numConfigs = 1;
+        ALOGE("DAVE, REPORTING CONFIG *IS* SUPPORTED %d", numConfigs);
         return 0;
+    } else {
+        ALOGE("DAVE, REPORTING CONFIG NOT SUPPORTED%d", numConfigs);
     }
     return -EINVAL;
 }
@@ -738,10 +690,10 @@ hwc_blank (struct hwc_composer_device_1 *dev, int disp, int blank)
     if (!is_display_connected (ctx, disp))
         return -EINVAL;
 
-    arg = blank ? FB_BLANK_POWERDOWN : FB_BLANK_UNBLANK;
+    arg = 0;//DAVE blank ? FB_BLANK_POWERDOWN : FB_BLANK_UNBLANK;
 
-    ret = ioctl (ctx->drm_fd, FBIOBLANK, arg);
-    return ret;
+//     ret = ioctl (ctx->drm_fd, FBIOBLANK, arg);
+    return 0;
 }
 
 static void
@@ -767,16 +719,16 @@ hwc_device_close (struct hw_device_t *dev)
     return 0;
 }
 
-static void
-init_gralloc (int drm_fd)
-{
-    hw_module_t *pmodule = NULL;
-    private_module_t *m = NULL;
-    hw_get_module (GRALLOC_HARDWARE_MODULE_ID,
-        (const hw_module_t **) &pmodule);
-    m = reinterpret_cast < private_module_t * >(pmodule);
-    m->drm_fd = drm_fd;
-}
+// static void
+// init_gralloc (int drm_fd)
+// {
+//     hw_module_t *pmodule = NULL;
+//     private_module_t *m = NULL;
+//     hw_get_module (GRALLOC_HARDWARE_MODULE_ID,
+//         (const hw_module_t **) &pmodule);
+//     m = reinterpret_cast < private_module_t * >(pmodule);
+//     m->drm_fd = drm_fd;
+// }
 
 static int
 hwc_get_connector (char *conn_str)
@@ -864,7 +816,7 @@ hwc_device_open (const struct hw_module_t *module, const char *name,
 
     ctx->used_planes = 0;
 
-    init_gralloc (ctx->drm_fd);
+//     init_gralloc (ctx->drm_fd);
 
     pthread_attr_t attrs;
     pthread_attr_init (&attrs);
