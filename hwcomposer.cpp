@@ -169,6 +169,8 @@ init_display (hwc_context_t * ctx, int disp, uint32_t connector_type)
         drm_fd = ctx->drm_fd;
     }
 
+    drmSetMaster(drm_fd);
+
     resources = drmModeGetResources (drm_fd);
     if (!resources) {
         ALOGE ("Failed to get resources: %s\n", strerror (errno));
